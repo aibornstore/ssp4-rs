@@ -144,42 +144,113 @@ pub fn encode(data: &[u8], s: &[u64], block_bits: usize, delta: bool) -> Vec<u8>
         _raw_count += 1;
     }
 
-    // Phase A: ZERO-RLE compression
+    // Phase B: TWO-PASS compression over Phase A symbols
+    // Pass 1: detect MFS (most frequent symbol) and RAW frequencies
+    let mut k_freq: HashMap<u64, u32> = HashMap::new();
+    let mut raw_freq: HashMap<u64, u32> = HashMap::new();
+    for &(tag, val) in &symbols {
+        if tag == 0 {
+            *k_freq.entry(val).or_insert(0) += 1;
+        } else if tag == 1 {
+            *raw_freq.entry(val).or_insert(0) += 1;
+        }
+    }
+
+    // MFS: most frequent SYM value (threshold >= 8)
+    let mfs_val = if let Some((&k, &cnt)) = k_freq.iter().max_by_key(|&(_, c)| c) {
+        if cnt >= 8 { Some(k) } else { None }
+    } else {
+        None
+    };
+
+    // RAW-MFS: disabled in v45 (interferes with header parsing)
+    // RAW-RLE threshold
     let rle_threshold = 4;
+
+    // Pass 2: build compressed_symbols with Phase B optimizations
+    // Using separate lists: (tag, val) and (run_count for RAW-RLE)
     let mut compressed: Vec<(u8, u64)> = Vec::with_capacity(symbols.len());
+    let mut raw_rle_runs: Vec<u64> = Vec::new(); // run counts parallel to compressed
     let mut i = 0;
     while i < symbols.len() {
         let (tag, val) = symbols[i];
+
+        // SYM-MFS: replace with short tag (tag=4)
+        if tag == 0 {
+            if let Some(mfs) = mfs_val {
+                if val == mfs {
+                    compressed.push((4, 0)); // tag 4: MFS, no payload
+                    raw_rle_runs.push(0);
+                    i += 1;
+                    continue;
+                }
+            }
+            compressed.push((tag, val));
+            raw_rle_runs.push(0);
+            i += 1;
+            continue;
+        }
+
+        // ZERO-RLE (tag=3): consecutive zeros
         if tag == 2 {
-            // ZERO-RLE
             let mut run = 1;
             while i + run < symbols.len() && symbols[i + run].0 == 2 {
                 run += 1;
             }
             if run >= rle_threshold {
                 compressed.push((3, run as u64)); // tag 3: ZERO-RLE
+                raw_rle_runs.push(0);
                 i += run;
                 continue;
             }
             // Fall through: emit individual zeros
             for _ in 0..run {
                 compressed.push((2, 0));
+                raw_rle_runs.push(0);
             }
             i += run;
             continue;
         }
+
+        // RAW-RLE (tag=5): consecutive identical RAW values
+        if tag == 1 {
+            let mut run = 1;
+            while i + run < symbols.len()
+                && symbols[i + run].0 == 1
+                && symbols[i + run].1 == val
+            {
+                run += 1;
+            }
+            if run >= rle_threshold {
+                compressed.push((5, val)); // tag 5: RAW-RLE
+                raw_rle_runs.push(run as u64);
+                i += run;
+                continue;
+            }
+            compressed.push((1, val));
+            raw_rle_runs.push(0);
+            i += 1;
+            continue;
+        }
+
         compressed.push((tag, val));
+        raw_rle_runs.push(0);
         i += 1;
     }
+
+    // Check what Phase B features were used
+    let rle_used = compressed.iter().any(|(t, _)| *t == 3 || *t == 5);
+    let mfs_used = mfs_val.is_some() && compressed.iter().any(|(t, _)| *t == 4);
 
     // Build archive header
     let mut header = Vec::with_capacity(64);
     header.extend_from_slice(SSP5_MAGIC);
     header.push(SSP5_VERSION);
-    // flags: bit0=delta, bit1=RLE, bit3=odd_sep
-    let rle_used = compressed.iter().any(|(t, _)| *t == 3);
+
+    // flags: bit0=delta, bit1=RLE, bit2=MFS, bit3=odd_sep
     let flags = (if delta { 1u8 } else { 0 })
         | (if rle_used { 2u8 } else { 0 })
+        | (if mfs_used { 4u8 } else { 0 })
         | (if use_odd_sep { 8u8 } else { 0 });
     header.push(flags);
     header.push(block_bits as u8);
@@ -189,9 +260,23 @@ pub fn encode(data: &[u8], s: &[u64], block_bits: usize, delta: bool) -> Vec<u8>
     header.extend_from_slice(&uleb_vec(data_len as u64));
     header.extend_from_slice(&uleb_vec(num_blocks as u64));
 
+    // MFS: write mfs_k to header AFTER ULEB fields (matches Python order)
+    if mfs_used {
+        if let Some(mfs) = mfs_val {
+            if use_odd_sep {
+                let mfs_odd = (mfs & 1) as u8;
+                let mfs_k = mfs >> 1;
+                header.push(mfs_odd);
+                header.extend_from_slice(&uleb_vec(mfs_k));
+            } else {
+                header.extend_from_slice(&uleb_vec(mfs)); // packed_k
+            }
+        }
+    }
+
     // Encode body
     let mut bw = BitWriter::new();
-    for (tag, value) in compressed.iter() {
+    for ((tag, value), &run) in compressed.iter().zip(raw_rle_runs.iter()) {
         match *tag {
             0 => {
                 // SYM
@@ -215,9 +300,19 @@ pub fn encode(data: &[u8], s: &[u64], block_bits: usize, delta: bool) -> Vec<u8>
                 bw.write_bits(2, 2); // 10
             }
             3 => {
-                // ZERO-RLE
+                // ZERO-RLE: 3-bit tag 110
                 bw.write_bits(0b110, 3);
                 bw.write_uleb(*value);
+            }
+            4 => {
+                // MFS: 3-bit tag 111, no payload
+                bw.write_bits(0b111, 3);
+            }
+            5 => {
+                // RAW-RLE: 3-bit tag 111, value bits + run ULEB
+                bw.write_bits(0b111, 3);
+                bw.write_bits(*value, block_bits);
+                bw.write_uleb(run);
             }
             _ => {}
         }
@@ -247,6 +342,8 @@ pub fn decode(archive: &[u8], s: &[u64]) -> Result<Vec<u8>, &'static str> {
     let flags = archive[off];
     off += 1;
     let delta = (flags & 1) != 0;
+    let rle_enabled = (flags & 2) != 0;
+    let mfs_enabled = (flags & 4) != 0;
     let use_odd_sep = (flags & 8) != 0;
 
     let block_bits = archive[off] as usize;
@@ -266,6 +363,36 @@ pub fn decode(archive: &[u8], s: &[u64]) -> Result<Vec<u8>, &'static str> {
     off += n3;
     let (num_blocks, n4) = uleb_decode_all(&archive[off..])?;
     off += n4;
+
+    // Read MFS value from header AFTER ULEB fields (matches Python order)
+    let mfs_val = if mfs_enabled {
+        if use_odd_sep {
+            let mfs_odd = archive[off] as u64;
+            off += 1;
+            let (mfs_k, n) = uleb_decode_all(&archive[off..])?;
+            off += n;
+            let sym_val = if mfs_k > 0 {
+                decode_symbol(mfs_k, s).unwrap_or(0)
+            } else {
+                0
+            };
+            sym_val + mfs_odd
+        } else {
+            let (packed_k, n) = uleb_decode_all(&archive[off..])?;
+            off += n;
+            let k = packed_k >> 1;
+            let odd = packed_k & 1;
+            let sym_val = if k > 0 {
+                decode_symbol(k, s).unwrap_or(0)
+            } else {
+                0
+            };
+            sym_val + odd
+        }
+    } else {
+        0
+    };
+
     let body = &archive[off..];
 
     // Decode body
@@ -275,15 +402,49 @@ pub fn decode(archive: &[u8], s: &[u64]) -> Result<Vec<u8>, &'static str> {
     let mut blocks_decoded: u64 = 0;
 
     while blocks_decoded < num_blocks {
-        // Read tag
+        // Read tag (2 bits for Phase A, 3 bits for Phase B extended)
         if br.is_exhausted() {
             break;
         }
-        let tag = br.read_bits(2).unwrap_or(0);
+        let tag_bits = br.read_bits(2).unwrap_or(0);
+
+        // Phase B extended: 3-bit tags when first 2 bits are 11
+        // 110 = ZERO-RLE (tag=3), 111 = MFS (tag=4) or RAW-RLE (tag=5)
+        let (tag, _count) = if tag_bits == 3 {
+            let third = br.read_bit().unwrap_or(0);
+            if third == 0 && rle_enabled {
+                // 110 = ZERO-RLE
+                (3u8, 1u64)
+            } else if third == 1 && mfs_enabled {
+                // 111 = MFS (tag=4)
+                (4u8, 1u64)
+            } else {
+                // RAW-RLE: 111 with mfs disabled — treat as RAW-RLE
+                // Read RAW-RLE payload: value bits + run ULEB
+                let raw_val = br.read_bits(block_bits).unwrap_or(0);
+                let run = br.read_uleb().unwrap_or(1);
+                // Emit RAW blocks
+                for _ in 0..run {
+                    let n = if delta {
+                        prev_n.wrapping_add(raw_val) & max_block_val
+                    } else {
+                        raw_val
+                    };
+                    prev_n = n;
+                    let needed = (block_bits + 7) / 8;
+                    let be_bytes = n.to_be_bytes();
+                    output.extend_from_slice(&be_bytes[be_bytes.len() - needed..]);
+                }
+                blocks_decoded += run;
+                continue;
+            }
+        } else {
+            (tag_bits as u8, 1u64)
+        };
 
         // skip_to_byte_boundary: for SYM (tag=0) and ZERO-RLE (tag=3),
         // the next payload (ULEB) starts at the next byte boundary.
-        // For RAW (tag=1) and ZERO (tag=2): payload starts immediately at current bit_pos.
+        // For RAW (tag=1) and ZERO (tag=2): payload starts immediately.
         if tag == 0 || tag == 3 {
             br.skip_to_byte_boundary();
         }
@@ -377,6 +538,20 @@ pub fn decode(archive: &[u8], s: &[u64]) -> Result<Vec<u8>, &'static str> {
                     output.extend_from_slice(&be_bytes[be_bytes.len() - needed..]);
                 }
                 blocks_decoded += count;
+            }
+            4 => {
+                // MFS: 3 bits 111, no payload — value is mfs_val
+                // (count comes from the 3-bit tag dispatch above)
+                let n = if delta {
+                    prev_n.wrapping_add(mfs_val) & max_block_val
+                } else {
+                    mfs_val
+                };
+                prev_n = n;
+                let needed = (block_bits + 7) / 8;
+                let be_bytes = n.to_be_bytes();
+                output.extend_from_slice(&be_bytes[be_bytes.len() - needed..]);
+                blocks_decoded += 1;
             }
             _ => {
                 break;
@@ -492,7 +667,6 @@ mod tests {
         let s = test_s();
         let data = [12u8];
         let enc = encode(&data, &s, 16, false);
-        
         let dec = decode(&enc, &s).expect("decode should succeed");
         assert_eq!(dec.len(), 1, "decoded length should be 1");
         assert_eq!(dec[0], 12, "decoded byte should be 12");

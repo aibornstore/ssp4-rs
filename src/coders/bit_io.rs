@@ -28,10 +28,9 @@ impl BitWriter {
     }
 
     /// Write `count` bits from `value` (MSB-first).
-    /// Matches Python BitWriter.write_bits fast path: when at byte boundary (bit_pos=0)
-    /// and count >= 8, writes complete bytes directly (no per-bit loop).
+    /// When at byte boundary (bit_pos=0) and count >= 8, writes complete bytes directly.
     pub fn write_bits(&mut self, value: u64, mut count: usize) {
-        // Byte-aligned fast path (matches Python BitWriter.write_bits lines 865-871)
+        // Byte-aligned fast path: write complete bytes directly
         if self.bit_pos == 0 && count >= 8 {
             while count >= 8 {
                 self.buf.push((value >> (count - 8)) as u8);
@@ -39,9 +38,9 @@ impl BitWriter {
             }
         }
         // Per-bit loop for remaining bits.
-        // Extract bits count-1, count-2, ..., 0 from value (MSB-first).
+        // remaining tracks bits left to write; initialized to current count (post-fast-path).
         let mut remaining = count;
-        for _ in 0..count {
+        for _ in 0..remaining {
             let bit = ((value >> (remaining - 1)) & 1) as u8;
             self.write_bit(bit);
             remaining -= 1;
@@ -151,22 +150,46 @@ impl<'a> BitReader<'a> {
                 return Ok(value);
             }
         }
-        // For non-byte-aligned reads: extract bits from stream position B to B+count-1.
-        // Bit (B + count - 1) is the MSB, bit B is the LSB.
+        // Non-byte-aligned: read remaining bits of current byte, then full bytes.
+        let mut bits_read = 0usize;
         let mut value = 0u64;
-        for i in 0..count {
-            let abs_pos = self.bit_pos as usize + self.byte_pos * 8 + i;
-            let byte_idx = abs_pos >> 3;
-            let bit_in_byte = 7 - (abs_pos & 7);
-            if byte_idx >= self.data.len() {
-                break;
+
+        // 1. Remaining bits in current byte (to reach next byte boundary)
+        if self.bit_pos > 0 {
+            let bits_to_byte_boundary = 8 - self.bit_pos as usize;
+            for _ in 0..bits_to_byte_boundary {
+                if bits_read >= count || self.byte_pos >= self.data.len() { break; }
+                let b = (self.data[self.byte_pos] >> (7 - self.bit_pos)) & 1;
+                self.bit_pos += 1;
+                if self.bit_pos == 8 {
+                    self.bit_pos = 0;
+                    self.byte_pos += 1;
+                }
+                value = (value << 1) | b as u64;
+                bits_read += 1;
             }
-            value = (value << 1) | ((self.data[byte_idx] >> bit_in_byte) & 1) as u64;
         }
-        // Advance: move forward by count bits
-        let abs_end = self.bit_pos as usize + self.byte_pos * 8 + count;
-        self.byte_pos = abs_end >> 3;
-        self.bit_pos = (abs_end & 7) as u8;
+
+        // 2. Full bytes (read 8 bits at a time)
+        while bits_read + 8 <= count && self.byte_pos < self.data.len() {
+            let b = self.data[self.byte_pos];
+            self.byte_pos += 1;
+            value = (value << 8) | b as u64;
+            bits_read += 8;
+        }
+
+        // 3. Remaining bits (less than 8, per-bit loop)
+        while bits_read < count && self.byte_pos < self.data.len() {
+            let b = (self.data[self.byte_pos] >> (7 - self.bit_pos)) & 1;
+            self.bit_pos += 1;
+            if self.bit_pos == 8 {
+                self.bit_pos = 0;
+                self.byte_pos += 1;
+            }
+            value = (value << 1) | b as u64;
+            bits_read += 1;
+        }
+
         Ok(value)
     }
 
@@ -187,11 +210,22 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read a ULEB128-encoded integer (7 bits per byte, MSB = continuation).
+    /// Skips to the next byte boundary first, then reads raw bytes.
     pub fn read_uleb(&mut self) -> Result<u64, &'static str> {
+        // Skip to next byte boundary: consume remaining bits of current byte
+        if self.bit_pos != 0 && self.byte_pos < self.data.len() {
+            self.byte_pos += 1;
+            self.bit_pos = 0;
+        }
+        // Now read raw bytes (ULEB is byte-aligned)
         let mut result = 0u64;
         let mut shift = 0u32;
         loop {
-            let byte = self.read_bits(8)? as u8;
+            if self.byte_pos >= self.data.len() {
+                return Err("ULEB read past end of data");
+            }
+            let byte = self.data[self.byte_pos];
+            self.byte_pos += 1;
             result |= ((byte & 0x7F) as u64) << shift;
             if (byte & 0x80) == 0 {
                 break;
