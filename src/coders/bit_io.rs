@@ -69,6 +69,20 @@ impl BitWriter {
         self.buf.push(x as u8);
     }
 
+    /// Write a Rice-coded value with parameter k (0 ≤ k ≤ 31).
+    /// Format: unary quotient (q ones + 0), then k bits of remainder.
+    pub fn write_rice(&mut self, value: u64, k: usize) {
+        let mut q = value >> k;
+        while q > 0 {
+            self.write_bit(1);
+            q -= 1;
+        }
+        self.write_bit(0);
+        if k > 0 {
+            self.write_bits(value & ((1u64 << k) - 1), k);
+        }
+    }
+
     /// Flush partial byte and return owned bytes.
     pub fn flush(mut self) -> Vec<u8> {
         if self.bit_pos > 0 {
@@ -235,6 +249,22 @@ impl<'a> BitReader<'a> {
         Ok(result)
     }
 
+    /// Read a Rice-coded value with parameter k (0 ≤ k ≤ 31).
+    /// Format: unary quotient (q ones + 0), then k bits of remainder.
+    pub fn read_rice(&mut self, k: usize) -> Result<u64, &'static str> {
+        let mut q = 0u64;
+        loop {
+            let b = self.read_bit()?;
+            if b == 1 {
+                q += 1;
+            } else {
+                break;
+            }
+        }
+        let r = if k > 0 { self.read_bits(k)? } else { 0 };
+        Ok((q << k) | r)
+    }
+
     /// Returns true if all data has been consumed.
     pub fn is_exhausted(&self) -> bool {
         self.byte_pos >= self.data.len()
@@ -308,5 +338,19 @@ mod tests {
         let mut br = BitReader::new(&data);
         assert_eq!(br.read_uleb().unwrap(), 300);
         assert_eq!(br.read_uleb().unwrap(), 10000);
+    }
+
+    #[test]
+    fn test_rice_roundtrip() {
+        for k in 0..=16 {
+            for val in [0u64, 1, 5, 10, 100, 1000, 65535] {
+                let mut bw = BitWriter::new();
+                bw.write_rice(val, k);
+                let data = bw.flush();
+                let mut br = BitReader::new(&data);
+                let dec = br.read_rice(k).unwrap();
+                assert_eq!(dec, val, "k={} val={}", k, val);
+            }
+        }
     }
 }

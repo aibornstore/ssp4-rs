@@ -136,9 +136,8 @@ pub fn find_symbol(
         } else if sum < n as u64 {
             lo += 1;
         } else {
-            if hi > 0 {
-                hi -= 1;
-            }
+            if hi == 0 { break; }
+            hi -= 1;
         }
     }
 

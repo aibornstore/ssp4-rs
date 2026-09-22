@@ -1,49 +1,86 @@
-//! Range coder (arithmetic coding) — API-compatible with cascade-codec-rs.
-//! Uses u64 range subdivision with byte-level I/O.
-//! Key invariant: encoder's byte output sequence must exactly match decoder's byte input sequence.
+//! Range coder (arithmetic coding) — bit-level, matching Python ssp4_local_v44.py.
+//! Uses 64-bit arithmetic internally, PREC=32 bits precision.
 
-const TOP: u64 = 1u64 << 32; // 2^32
-const BOT: u64 = 1u64 << 5;  // 2^5 — normalization threshold
-const MASK: u64 = TOP - 1;    // 0xFFFF_FFFF
+const PREC: u64 = 32;
+const HALF: u64 = 1u64 << (PREC - 1);   // 2^31
+const QUARTER: u64 = 1u64 << (PREC - 2); // 2^30
+const THREE_QUARTERS: u64 = 3 * QUARTER;  // 3 * 2^30
 
-/// Arithmetic encoder using u64 range subdivision.
+/// Bit-level range encoder (matches Python RangeEncoder).
 pub struct RangeEncoder {
-    low: u64,
-    range: u64,
-    buf: Vec<u8>,
+    lo: u64,
+    hi: u64,
+    pending: u64,
+    bits: Vec<u8>,
 }
 
 impl RangeEncoder {
     pub fn new() -> Self {
-        Self { low: 0, range: TOP, buf: Vec::new() }
-    }
-
-    fn normalize(&mut self) {
-        while self.range < BOT {
-            self.buf.push((self.low >> 24) as u8);
-            self.low = (self.low << 8) & MASK;
-            self.range <<= 8;
+        Self {
+            lo: 0,
+            hi: (1u64 << PREC) - 1,
+            pending: 0,
+            bits: Vec::new(),
         }
     }
 
-    /// Encode a symbol in range [cum_low, cum_high).
-    pub fn encode(&mut self, cum_low: u64, cum_high: u64, total: u64) {
-        let r = (self.range / total).max(1);
-        self.low += cum_low * r;
-        self.range = (cum_high - cum_low) * r;
-        self.low &= MASK;
-        self.normalize();
+    fn output_bit(&mut self, bit: u8) {
+        self.bits.push(bit);
+        for _ in 0..self.pending {
+            self.bits.push(1 - bit);
+        }
+        self.pending = 0;
     }
 
-    pub fn finish(&mut self) {
-        for _ in 0..5 {
-            self.buf.push((self.low >> 24) as u8);
-            self.low = (self.low << 8) & MASK;
+    /// Encode symbol with frequency range [cum_freq, cum_freq + freq).
+    /// cum_freq and freq are in [0, total), total is the scale.
+    pub fn encode(&mut self, cum_freq: u64, freq: u64, total: u64) {
+        let rng = self.hi - self.lo + 1;
+        self.hi = self.lo + (rng * (cum_freq + freq)) / total - 1;
+        self.lo = self.lo + (rng * cum_freq) / total;
+
+        loop {
+            if self.hi < HALF {
+                self.output_bit(0);
+            } else if self.lo >= HALF {
+                self.output_bit(1);
+                self.lo -= HALF;
+                self.hi -= HALF;
+            } else if self.lo >= QUARTER && self.hi < THREE_QUARTERS {
+                self.pending += 1;
+                self.lo -= QUARTER;
+                self.hi -= QUARTER;
+            } else {
+                break;
+            }
+            self.lo <<= 1;
+            self.hi = (self.hi << 1) | 1;
         }
     }
 
-    pub fn get_bytes(&self) -> &[u8] {
-        &self.buf
+    /// Finish encoding and return packed bytes (matches Python RangeEncoder.flush).
+    pub fn flush(&mut self) -> Vec<u8> {
+        self.pending += 1;
+        if self.lo < QUARTER {
+            self.output_bit(0);
+        } else {
+            self.output_bit(1);
+        }
+
+        // Pack bits into bytes (MSB first)
+        let mut out = Vec::new();
+        for i in (0..self.bits.len()).step_by(8) {
+            let mut byte = 0u8;
+            for j in 0..8 {
+                if i + j < self.bits.len() {
+                    byte = (byte << 1) | self.bits[i + j];
+                } else {
+                    byte <<= 1;
+                }
+            }
+            out.push(byte);
+        }
+        out
     }
 }
 
@@ -53,97 +90,77 @@ impl Default for RangeEncoder {
     }
 }
 
-/// Arithmetic decoder matching RangeEncoder.
+/// Bit-level range decoder (matches Python RangeDecoder).
 pub struct RangeDecoder<'a> {
-    low: u64,
-    range: u64,
-    code: u64,
-    data: &'a [u8],
+    bits: Vec<u8>,
     pos: usize,
+    lo: u64,
+    hi: u64,
+    code: u64,
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> RangeDecoder<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        let mut code: u64 = 0;
-        let mut pos = 0;
-        for _ in 0..4 {
-            if pos < data.len() {
-                code = (code << 8) | (data[pos] as u64);
-                pos += 1;
+        // Unpack bytes to bits (MSB first, matching Python)
+        let mut bits = Vec::with_capacity(data.len() * 8);
+        for &b in data {
+            for i in (0..8u8).rev() {
+                bits.push(((b >> i) & 1) as u8);
             }
         }
-        Self { low: 0, range: TOP, code, data, pos }
-    }
 
-    fn read_byte(&mut self) -> u8 {
-        if self.pos < self.data.len() {
-            let b = self.data[self.pos];
-            self.pos += 1;
-            b
-        } else {
-            0
+        let lo = 0;
+        let hi = (1u64 << PREC) - 1;
+        let mut code = 0u64;
+        let mut pos = 0usize;
+        for _ in 0..PREC {
+            code = (code << 1) | (bits.get(pos).copied().unwrap_or(0) as u64);
+            pos += 1;
         }
+
+        Self { bits, pos, lo, hi, code, _marker: std::marker::PhantomData }
     }
 
-    fn normalize(&mut self) {
-        while self.range < BOT {
-            self.code = ((self.code << 8) | (self.read_byte() as u64)) & MASK;
-            self.low = ((self.low << 8) | (self.read_byte() as u64)) & MASK;
-            self.range <<= 8;
-        }
+    fn read_bit(&mut self) -> u8 {
+        let b = self.bits.get(self.pos).copied().unwrap_or(0);
+        self.pos += 1;
+        b
     }
 
-    pub fn decode(&mut self, total: u64) -> (usize, u64) {
-        self.normalize();
-        let r = (self.range / total).max(1);
-        let idx = ((self.code.wrapping_sub(self.low)) / r) as usize;
-        (idx.min(total as usize - 1), r)
+    /// Get frequency bucket for current code position.
+    pub fn get_freq(&self, total: u64) -> u64 {
+        let rng = self.hi - self.lo + 1;
+        let cum = ((self.code.wrapping_sub(self.lo) + 1) * total - 1) / rng;
+        cum.min(total - 1)
     }
 
-    pub fn narrow(&mut self, cum_low: u64, cum_high: u64, r: u64) {
-        self.low += cum_low * r;
-        self.range = (cum_high - cum_low) * r;
-        self.low &= MASK;
-    }
+    /// Decode and narrow interval.
+    pub fn decode(&mut self, cum_freq: u64, freq: u64, total: u64) {
+        let rng = self.hi - self.lo + 1;
+        self.hi = self.lo + (rng * (cum_freq + freq)) / total - 1;
+        self.lo = self.lo + (rng * cum_freq) / total;
 
-    /// Read trailing bytes at the end (matching encoder's finish).
-    pub fn read_trailing(&mut self) {
-        for _ in 0..5 {
-            self.code = ((self.code << 8) | (self.read_byte() as u64)) & MASK;
-            self.low = ((self.low << 8) | (self.read_byte() as u64)) & MASK;
+        loop {
+            if self.hi < HALF {
+                // nothing
+            } else if self.lo >= HALF {
+                self.code -= HALF;
+                self.lo -= HALF;
+                self.hi -= HALF;
+            } else if self.lo >= QUARTER && self.hi < THREE_QUARTERS {
+                self.code -= QUARTER;
+                self.lo -= QUARTER;
+                self.hi -= QUARTER;
+            } else {
+                break;
+            }
+            self.lo <<= 1;
+            self.hi = (self.hi << 1) | 1;
+            self.code = (self.code << 1) | (self.read_bit() as u64);
         }
     }
 }
-
-/// Encode symbols using a range coder.
-// pub fn encode(syms: &[usize], cum: &[u64], total: u64) -> Vec<u8> {
-//     let mut enc = RangeEncoder::new();
-//     for &sym in syms {
-//         enc.encode(cum[sym], cum[sym + 1], total);
-//     }
-//     enc.finish();
-//     enc.buf
-// }
-
-/// Decode symbols from a range-coded stream.
-// pub fn decode(data: &[u8], n: usize, cum: &[u64], total: u64) -> Vec<usize> {
-//     let mut dec = RangeDecoder::new(data);
-//     let mut out = Vec::with_capacity(n);
-//     for _ in 0..n {
-//         let (idx, r) = dec.decode(total);
-//         let mut sym = 0;
-//         for i in 0..cum.len() - 1 {
-//             if cum[i] <= idx as u64 && (idx as u64) < cum[i + 1] {
-//                 sym = i;
-//                 break;
-//             }
-//         }
-//         out.push(sym);
-//         dec.narrow(cum[sym], cum[sym + 1], r);
-//     }
-//     dec.read_trailing();
-//     out
-// }
 
 #[cfg(test)]
 mod tests {
@@ -152,26 +169,24 @@ mod tests {
     fn roundtrip(syms: &[usize], cum: &[u64], total: u64) -> Vec<usize> {
         let mut enc = RangeEncoder::new();
         for &sym in syms {
-            enc.encode(cum[sym], cum[sym + 1], total);
+            enc.encode(cum[sym], cum[sym + 1] - cum[sym], total);
         }
-        enc.finish();
-        let data = enc.get_bytes().to_vec();
+        let data = enc.flush();
 
         let mut dec = RangeDecoder::new(&data);
         let mut out = Vec::with_capacity(syms.len());
         for _ in 0..syms.len() {
-            let (idx, r) = dec.decode(total);
-            let mut sym = 0;
+            let f = dec.get_freq(total);
+            let mut sym = 0usize;
             for i in 0..cum.len() - 1 {
-                if cum[i] <= idx as u64 && (idx as u64) < cum[i + 1] {
+                if cum[i] <= f && f < cum[i + 1] {
                     sym = i;
                     break;
                 }
             }
             out.push(sym);
-            dec.narrow(cum[sym], cum[sym + 1], r);
+            dec.decode(cum[sym], cum[sym + 1] - cum[sym], total);
         }
-        dec.read_trailing();
         out
     }
 
@@ -205,7 +220,6 @@ mod tests {
 
     #[test]
     fn test_large() {
-        // 30 binary symbols (within 32-bit precision)
         let cum = vec![0, 1, 2];
         let syms: Vec<usize> = (0..30).map(|i| i % 2).collect();
         assert_eq!(roundtrip(&syms, &cum, 2), syms);
@@ -213,7 +227,6 @@ mod tests {
 
     #[test]
     fn test_many_symbols() {
-        // 8 uniform symbols (safe within 32-bit precision)
         let cum: Vec<u64> = (0..=8).collect();
         let syms: Vec<usize> = (0..8).collect();
         assert_eq!(roundtrip(&syms, &cum, 8), syms);
