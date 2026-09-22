@@ -8,7 +8,8 @@
 //! Dictionary improvements:
 //! - Window 64KB → 256KB for longer-distance matches
 //! - Chain 100 → 512 for better match coverage
-//! - Better prune strategy: keep positions closest to current pos
+//! - 4-byte hash (32-bit) for better selectivity vs 3-byte (24-bit)
+//! - Lazy matching avoids short-match traps
 
 use std::collections::HashMap;
 
@@ -20,6 +21,32 @@ pub enum Token {
     Match { offset: u32, length: u8 },
 }
 
+/// Compute 4-byte hash for LZ77 dictionary.
+/// Falls back to 3-byte hash if data is too short.
+/// 4-byte hash provides better selectivity (fewer false positives).
+fn compute_hash(data: &[u8], i: usize) -> u32 {
+    if i + 4 <= data.len() {
+        // Full 4-byte hash
+        ((data[i] as u32) << 24) 
+            | ((data[i + 1] as u32) << 16) 
+            | ((data[i + 2] as u32) << 8) 
+            | (data[i + 3] as u32)
+    } else if i + 3 <= data.len() {
+        // Fallback to 3-byte hash
+        ((data[i] as u32) << 16) 
+            | ((data[i + 1] as u32) << 8) 
+            | (data[i + 2] as u32)
+    } else if i + 2 <= data.len() {
+        // 2-byte hash
+        ((data[i] as u32) << 8) | (data[i + 1] as u32)
+    } else if i + 1 <= data.len() {
+        // 1-byte hash
+        data[i] as u32
+    } else {
+        0
+    }
+}
+
 /// Find the best match for data at position i, returning full match info
 /// Used internally for lazy matching decisions
 fn find_match_info(data: &[u8], chain: &HashMap<u32, Vec<u32>>, i: usize, max_match: usize, window_size: usize) -> Option<(u32, usize, usize)> {
@@ -27,7 +54,7 @@ fn find_match_info(data: &[u8], chain: &HashMap<u32, Vec<u32>>, i: usize, max_ma
         return None;
     }
 
-    let h = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
+    let h = compute_hash(data, i);
     let positions = chain.get(&h)?;
 
     let mut best_offset = 0u32;
@@ -100,9 +127,12 @@ pub fn encode(data: &[u8]) -> Vec<Token> {
 
     let mut chain: HashMap<u32, Vec<u32>> = HashMap::new();
 
-    // Pre-populate for first 3 bytes
-    if n >= 3 {
-        let h = ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32);
+    // Pre-populate for first 4 bytes (4-byte hash)
+    if n >= 4 {
+        let h = compute_hash(data, 0);
+        chain.insert(h, vec![0]);
+    } else if n >= 3 {
+        let h = compute_hash(data, 0);
         chain.insert(h, vec![0]);
     }
 
@@ -120,7 +150,7 @@ pub fn encode(data: &[u8]) -> Vec<Token> {
                 // No match at position i — emit literal
                 tokens.push(Token::Literal(data[i]));
                 if i + 3 <= n {
-                    let h2 = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
+                    let h2 = compute_hash(data, i);
                     chain.entry(h2).or_default().push(i as u32);
                     if let Some(vec) = chain.get_mut(&h2) {
                         if vec.len() > MAX_CHAIN_SIZE {
@@ -139,9 +169,9 @@ pub fn encode(data: &[u8]) -> Vec<Token> {
                     tokens.push(Token::Match { offset: best_offset, length: best_length as u8 });
                     let match_end = i + best_length as usize;
                     // Insert hashes for positions immediately after the match
-                    for j in (match_end)..(match_end + 2).min(n) {
+                    for j in (match_end)..(match_end + 3).min(n) {
                         if j + 3 <= n {
-                            let h2 = ((data[j] as u32) << 16) | ((data[j + 1] as u32) << 8) | (data[j + 2] as u32);
+                            let h2 = compute_hash(data, j);
                             chain.entry(h2).or_default().push(j as u32);
                             if let Some(vec) = chain.get_mut(&h2) {
                                 if vec.len() > MAX_CHAIN_SIZE {
@@ -190,7 +220,7 @@ pub fn encode(data: &[u8]) -> Vec<Token> {
                     if better_match_len > best_length {
                         tokens.push(Token::Literal(data[i]));
                         if i + 3 <= n {
-                            let h2 = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
+                            let h2 = compute_hash(data, i);
                             chain.entry(h2).or_default().push(i as u32);
                             if let Some(vec) = chain.get_mut(&h2) {
                                 if vec.len() > MAX_CHAIN_SIZE {
@@ -206,9 +236,9 @@ pub fn encode(data: &[u8]) -> Vec<Token> {
                 // No better match found in lookahead — emit the match at i
                 tokens.push(Token::Match { offset: best_offset, length: best_length as u8 });
                 let match_end = i + best_length as usize;
-                for j in (match_end)..(match_end + 2).min(n) {
+                for j in (match_end)..(match_end + 3).min(n) {
                     if j + 3 <= n {
-                        let h2 = ((data[j] as u32) << 16) | ((data[j + 1] as u32) << 8) | (data[j + 2] as u32);
+                        let h2 = compute_hash(data, j);
                         chain.entry(h2).or_default().push(j as u32);
                         if let Some(vec) = chain.get_mut(&h2) {
                             if vec.len() > MAX_CHAIN_SIZE {
