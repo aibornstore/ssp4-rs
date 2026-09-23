@@ -3,16 +3,22 @@
 ## Unreleased
 
 ### Added
-- **Real data compression tests** (`src/coders/real_data_test.rs`): New test module verifying SSP5 pipeline compression on real data files (alice29, test_100k, test_repetitive). Compression ratios: 62-64% on text data, 25% on repetitive 1000-byte data.
-- Integrated `real_data_test` module into `src/coders/mod.rs`.
+- **Range coder pipeline** (`src/coders/range_coder.rs`): Adaptive order-0 range coder for byte streams
+  - `range_encode_bytes()` and `range_decode_bytes()` functions
+  - Near-optimal compression for byte distributions
+- **BWT→MTF→RangeCoder pipeline** (`src/coders/ssp5_pipeline.rs`):
+  - `ssp5_encode_with_range_coder()` and `ssp5_decode_with_range_coder()` functions
+  - Archive v4 format: [MAGIC(4)][VERSION=4(1)][PRIMARY(4)][MTF_LEN(4)][RC_DATA...]
+  - Compression improvement: alice29 62.39%→32.22% (30pp), repetitive 25.40%→5.32% (20pp)
+- **Real data compression tests** (`src/coders/real_data_test.rs`): New test module comparing SSP vs RangeCoder pipelines on real data files.
 
 ### Fixed
-- **OOM in `test_encode_decode_roundtrip`**: Resolved stack buffer overrun (exit code 0xc0000409) that occurred during `cargo test --lib test_encode_decode_roundtrip`. Test now passes reliably in isolation.
+- **OOM in `test_encode_decode_roundtrip`**: Resolved stack buffer overrun (exit code 0xc0000409).
 
 ### Changed
-- Updated `real_data_test.rs` to use current pipeline API (`ssp5_encode_auto`) instead of deprecated `ssp5_encode_with_huffman` and `rle_encode` functions.
+- Updated `real_data_test.rs` to compare SSP and RangeCoder pipelines with roundtrip verification.
 
-## Previous
+## Previous (v0.1.0)
 
 ### Added
 - RLE after MTF before Huffman (bzip2-style) pipeline: BWT→MTF→RLE→Huffman
