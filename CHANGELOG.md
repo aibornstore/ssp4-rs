@@ -7,7 +7,8 @@
   - Order-0: `range_encode_bytes()` / `range_decode_bytes()` (v4)
   - Order-1: `range_encode_bytes_order1()` / `range_decode_bytes_order1()` (v5)
   - Order-2: `range_encode_bytes_order2()` / `range_decode_bytes_order2()` (v6)
-  - **Order-Mix**: `range_encode_bytes_order_mix()` / `range_decode_bytes_order_mix()` (v7) - adaptive blend O0+O1
+  - **Order-Mix (O0+O1)**: `range_encode_bytes_order_mix()` / `range_decode_bytes_order_mix()` (v7) - weighted blend
+  - **Order-1+2 Mix**: `range_encode_bytes_order12_mix()` / `range_decode_bytes_order12_mix()` (v8) - adaptive O1+O2
 - **Real data compression tests** comparing all pipeline variants.
 
 ### Compression Results (alice29.txt 152KB)
@@ -17,9 +18,10 @@
 | RC O0 | 32.22% | 30pp better |
 | RC O1 | 31.63% | 31pp better |
 | RC O2 | 37.26% | 25pp better |
-| **RC MIX** | **31.33%** | **31pp better** |
+| RC O1+2 | 32.62% | 30pp better |
+| **RC MIX (O0+O1)** | **31.33%** | **31pp better** |
 
-**Note:** RC MIX (adaptive O0+O1 blend) achieves best compression by switching contexts adaptively.
+**Note:** RC MIX (O0+O1 weighted blend) is optimal for text/MTF data. O1+O2 mix underperforms because O2 context is too sparse.
 
 ### Compression Results (test_alice.txt 100KB)
 | Pipeline | Ratio |
@@ -28,7 +30,8 @@
 | RC O0 | 33.42% |
 | RC O1 | 33.58% |
 | RC O2 | 40.49% |
-| **RC MIX** | **32.62%** |
+| RC O1+2 | 34.93% |
+| **RC MIX (O0+O1)** | **32.62%** |
 
 ### Fixed
 - **OOM in `test_encode_decode_roundtrip`**: Resolved stack buffer overrun.
