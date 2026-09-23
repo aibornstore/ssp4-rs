@@ -6,7 +6,8 @@ use super::ssp5_pipeline::{ssp5_encode_auto, ssp5_encode, ssp5_decode,
                            ssp5_encode_with_range_coder_mix, ssp5_decode_with_range_coder_mix,
                            ssp5_encode_with_range_coder_o12, ssp5_decode_with_range_coder_o12,
                            ssp5_encode_with_range_coder_ewma, ssp5_decode_with_range_coder_ewma,
-                           ssp5_encode_with_range_coder_ewma3, ssp5_decode_with_range_coder_ewma3};
+                           ssp5_encode_with_range_coder_ewma3, ssp5_decode_with_range_coder_ewma3,
+                           ssp5_encode_with_range_coder_ewma5, ssp5_decode_with_range_coder_ewma5};
 use std::fs;
 
 fn test_real_data_compression() {
@@ -72,6 +73,11 @@ fn test_real_data_compression() {
                 let ewma3_ratio = 100.0 * ewma3_compressed.len() as f64 / data.len() as f64;
                 println!("    RC EWMA3:   {} bytes ({:.2}%)", ewma3_compressed.len(), ewma3_ratio);
                 
+                // Range coder O0+O1+O2+O3+O4+O5 EWMA pipeline
+                let ewma5_compressed = ssp5_encode_with_range_coder_ewma5(&data);
+                let ewma5_ratio = 100.0 * ewma5_compressed.len() as f64 / data.len() as f64;
+                println!("    RC EWMA5:   {} bytes ({:.2}%)", ewma5_compressed.len(), ewma5_ratio);
+                
                 // Verify roundtrips
                 let rc_decoded = ssp5_decode_with_range_coder(&rc_compressed);
                 let rc1_decoded = ssp5_decode_with_range_coder_o1(&rc1_compressed);
@@ -121,6 +127,13 @@ fn test_real_data_compression() {
                     println!("    RC EWMA3 roundtrip: OK");
                 } else {
                     println!("    RC EWMA3 roundtrip: FAILED");
+                }
+                
+                let ewma5_decoded = ssp5_decode_with_range_coder_ewma5(&ewma5_compressed);
+                if ewma5_decoded.as_ref().map_or(false, |d| d == &data) {
+                    println!("    RC EWMA5 roundtrip: OK");
+                } else {
+                    println!("    RC EWMA5 roundtrip: FAILED");
                 }
             }
             Err(e) => println!("    Error reading {}: {}", path, e),
