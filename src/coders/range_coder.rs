@@ -162,6 +162,92 @@ impl<'a> RangeDecoder<'a> {
     }
 }
 
+/// Adaptive order-0 range encoder for byte data.
+/// Uses uniform initial frequencies (all 256 symbols), then adapts after each symbol.
+pub fn range_encode_bytes(data: &[u8]) -> Vec<u8> {
+    let mut enc = RangeEncoder::new();
+    let mut freqs = [1u64; 256];
+    let mut total: u64 = 256;
+    
+    for &b in data {
+        let sym = b as usize;
+        let mut cum = 0u64;
+        for i in 0..sym {
+            cum += freqs[i];
+        }
+        let freq = freqs[sym];
+        enc.encode(cum, freq, total);
+        freqs[sym] += 1;
+        total += 1;
+    }
+    
+    let mut out = Vec::new();
+    // Write symbol count as ULEB first (allows decoder to know expected length)
+    let mut v = data.len() as u64;
+    while v >= 0x80 {
+        out.push(((v & 0x7F) | 0x80) as u8);
+        v >>= 7;
+    }
+    out.push((v & 0x7F) as u8);
+    out.extend(enc.flush());
+    out
+}
+
+/// Adaptive order-0 range decoder for byte data.
+/// Returns error if data is truncated or corrupted.
+pub fn range_decode_bytes(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    
+    // Read symbol count from ULEB prefix
+    let mut pos = 0;
+    let mut count: u64 = 0;
+    let mut shift = 0u32;
+    loop {
+        if pos >= data.len() {
+            return Err("Range decode: truncated ULEB count");
+        }
+        let b = data[pos];
+        pos += 1;
+        count |= ((b & 0x7F) as u64) << shift;
+        if (b & 0x80) == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    
+    let range_data = &data[pos..];
+    let mut dec = RangeDecoder::new(range_data);
+    let mut out = Vec::with_capacity(count as usize);
+    
+    let mut freqs = [1u64; 256];
+    let mut total: u64 = 256;
+    
+    for _ in 0..count {
+        let f = dec.get_freq(total);
+        
+        // Find symbol by cumulative frequency lookup
+        let mut cum = 0u64;
+        let mut sym = 0u8;
+        for i in 0..256 {
+            cum += freqs[i];
+            if f < cum {
+                sym = i as u8;
+                break;
+            }
+        }
+        
+        let freq = freqs[sym as usize];
+        dec.decode(cum - freq, freq, total);
+        freqs[sym as usize] += 1;
+        total += 1;
+        out.push(sym);
+    }
+    
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +330,48 @@ mod tests {
         let cum = vec![0, 1, 2, 3, 4, 5];
         let syms = vec![2, 2, 2, 2, 2, 2, 2, 2, 2, 2];
         assert_eq!(roundtrip(&syms, &cum, 5), syms);
+    }
+    
+    #[test]
+    fn test_range_encode_bytes_empty() {
+        let encoded = range_encode_bytes(&[]);
+        // Empty data still produces flush bits; count prefix is 0
+        let decoded = range_decode_bytes(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, Vec::<u8>::new());
+    }
+    
+    #[test]
+    fn test_range_encode_bytes_simple() {
+        let data = b"hello world";
+        let encoded = range_encode_bytes(data);
+        let decoded = range_decode_bytes(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_range_encode_bytes_all_bytes() {
+        let data: Vec<u8> = (0u8..=255).collect();
+        let encoded = range_encode_bytes(&data);
+        let decoded = range_decode_bytes(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_range_encode_bytes_skewed() {
+        // Skewed data: mostly zeros, a few non-zero
+        let mut data = vec![0u8; 100];
+        data.push(1);
+        data.push(2);
+        let encoded = range_encode_bytes(&data);
+        let decoded = range_decode_bytes(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_range_encode_bytes_roundtrip() {
+        let data = b"The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.";
+        let encoded = range_encode_bytes(data);
+        let decoded = range_decode_bytes(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, data);
     }
 }

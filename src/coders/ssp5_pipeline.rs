@@ -14,10 +14,12 @@ use super::bwt::{bwt_encode, bwt_decode, pack_bwt, unpack_bwt,
 use super::mtf::{mtf_encode, mtf_decode};
 use super::ssp_codec::{encode as ssp_encode, decode as ssp_decode};
 use super::lz77::{encode as lz77_encode, decode as lz77_decode, Token};
+use super::range_coder::{range_encode_bytes, range_decode_bytes};
 
 /// Wrapper magic: distinct from SSP5_MAGIC so ssp_decode finds SSP5_MAGIC at ssp_data offset
 const WRAPPER_MAGIC: &[u8; 4] = b"SS5W";
 const WRAPPER_VERSION: u8 = 3; // Version 3 supports chunked BWT
+const WRAPPER_VERSION_RC: u8 = 4; // Version 4 uses range coder instead of SSP
 
 /// Encode data with SSP5 pipeline: BWT → MTF → SSP (no LZ77)
 /// chunk_size: 0 = no chunking, >0 = split into chunks of that size
@@ -192,6 +194,71 @@ pub fn ssp5_encode_auto(data: &[u8], s: &[u64], block_bits: usize) -> Vec<u8> {
     }
 }
 
+/// Encode data with BWT → MTF → RangeCoder pipeline.
+/// Uses arithmetic coding instead of SSP for potentially better compression.
+/// Range coder provides near-optimal compression for byte streams.
+pub fn ssp5_encode_with_range_coder(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    
+    // BWT → pack(primary + last_col)
+    let (primary, bwt_data) = bwt_encode(data);
+    let bwt_packed = pack_bwt(primary, &bwt_data);
+    
+    // MTF encoding
+    let mtf_data = mtf_encode(&bwt_packed);
+    
+    // Range coder encoding
+    let rc_data = range_encode_bytes(&mtf_data);
+    
+    // Archive format v4:
+    // [WRAPPER_MAGIC(4)][VERSION=4(1)][PRIMARY(4)][MTF_LEN(4)][RC_DATA...]
+    let mut out = Vec::with_capacity(13 + rc_data.len());
+    out.extend_from_slice(WRAPPER_MAGIC);
+    out.push(WRAPPER_VERSION_RC);
+    out.extend_from_slice(&(primary as u32).to_le_bytes());
+    out.extend_from_slice(&(mtf_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&rc_data);
+    out
+}
+
+/// Decode data from BWT → MTF → RangeCoder pipeline.
+pub fn ssp5_decode_with_range_coder(archive: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if archive.is_empty() {
+        return Ok(Vec::new());
+    }
+    
+    // Check magic and version
+    if &archive[0..4] != WRAPPER_MAGIC {
+        return Err("Invalid wrapper magic");
+    }
+    if archive[4] != WRAPPER_VERSION_RC {
+        return Err("Invalid wrapper version for range coder");
+    }
+    
+    let primary = u32::from_le_bytes([archive[5], archive[6], archive[7], archive[8]]) as usize;
+    let mtf_len = u32::from_le_bytes([archive[9], archive[10], archive[11], archive[12]]) as usize;
+    let rc_data = &archive[13..];
+    
+    // Range coder decode
+    let mtf_data = range_decode_bytes(rc_data)?;
+    if mtf_data.len() != mtf_len {
+        return Err("MTF length mismatch");
+    }
+    
+    // MTF decode
+    let bwt_decoded = mtf_decode(&mtf_data);
+    
+    // Unpack and BWT decode
+    let (dec_primary, dec_bwt) = unpack_bwt(&bwt_decoded);
+    if dec_primary as u32 != primary as u32 {
+        return Err("BWT primary index mismatch");
+    }
+    
+    Ok(bwt_decode(dec_primary, &dec_bwt))
+}
+
 /// Serialize LZ77 tokens to bytes for BWT processing.
 /// Uses lz77::tokens_to_bytes (Rice-coded format).
 #[allow(dead_code)]
@@ -242,6 +309,54 @@ mod tests {
         let ratio = 100.0 * encoded.len() as f64 / data.len() as f64;
         println!("Compression ratio: {:.2}%", ratio);
         assert!(ratio < 15.0, "Should compress well: got {}%", ratio);
+    }
+    
+    #[test]
+    fn test_range_coder_roundtrip_small() {
+        let data = b"Hello World! This is a test of range coder.";
+        let encoded = ssp5_encode_with_range_coder(data);
+        let decoded = ssp5_decode_with_range_coder(&encoded).expect("decode should succeed");
+        assert_eq!(data.to_vec(), decoded);
+    }
+    
+    #[test]
+    fn test_range_coder_roundtrip_repeated() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        let encoded = ssp5_encode_with_range_coder(&data);
+        let decoded = ssp5_decode_with_range_coder(&encoded).expect("decode should succeed");
+        assert_eq!(data, decoded);
+    }
+    
+    #[test]
+    fn test_range_coder_compression_ratio() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(5000).copied().collect();
+        let encoded = ssp5_encode_with_range_coder(&data);
+        let ratio = 100.0 * encoded.len() as f64 / data.len() as f64;
+        println!("Range coder compression ratio: {:.2}%", ratio);
+        assert!(ratio < 15.0, "Should compress well: got {}%", ratio);
+    }
+    
+    #[test]
+    fn test_range_coder_vs_ssp_compression() {
+        // Compare range coder vs SSP on repetitive data
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(5000).copied().collect();
+        
+        let rc_encoded = ssp5_encode_with_range_coder(&data);
+        let rc_ratio = 100.0 * rc_encoded.len() as f64 / data.len() as f64;
+        
+        let s: Vec<u64> = vec![13, 17, 19, 23, 29, 31, 37, 41];
+        let ssp_encoded = ssp5_encode(&data, &s, 16);
+        let ssp_ratio = 100.0 * ssp_encoded.len() as f64 / data.len() as f64;
+        
+        println!("Range coder: {} bytes ({:.2}%)", rc_encoded.len(), rc_ratio);
+        println!("SSP codec:   {} bytes ({:.2}%)", ssp_encoded.len(), ssp_ratio);
+        
+        // Both should compress well
+        assert!(rc_ratio < 15.0, "Range coder should compress well");
+        assert!(ssp_ratio < 15.0, "SSP should compress well");
     }
     
     #[test]
