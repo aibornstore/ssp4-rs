@@ -1,6 +1,7 @@
 //! Test Huffman pipeline compression on real data files.
 use super::ssp5_pipeline::{ssp5_encode_auto, ssp5_encode, ssp5_decode, 
-                           ssp5_encode_with_range_coder, ssp5_decode_with_range_coder};
+                           ssp5_encode_with_range_coder, ssp5_decode_with_range_coder,
+                           ssp5_encode_with_range_coder_o1, ssp5_decode_with_range_coder_o1};
 use std::fs;
 
 fn test_real_data_compression() {
@@ -19,7 +20,7 @@ fn test_real_data_compression() {
         }
     }
     
-    println!("Testing SSP5 pipeline compression on real data:");
+    println!("\n=== SSP5 Pipeline Compression Comparison ===");
     for path in &files {
         match fs::read(path) {
             Ok(data) => {
@@ -28,31 +29,33 @@ fn test_real_data_compression() {
                 // SSP pipeline
                 let compressed = ssp5_encode_auto(&data, &s, 16);
                 let ratio = 100.0 * compressed.len() as f64 / data.len() as f64;
-                println!(
-                    "  {} ({:.0} bytes): SSP {} → {} bytes ({:.2}%)",
-                    path,
-                    data.len(),
-                    data.len(),
-                    compressed.len(),
-                    ratio
-                );
+                println!("\n  {} ({:.0} bytes):", path, data.len());
+                println!("    SSP:        {} bytes ({:.2}%)", compressed.len(), ratio);
                 
-                // Range coder pipeline
+                // Range coder order-0 pipeline
                 let rc_compressed = ssp5_encode_with_range_coder(&data);
                 let rc_ratio = 100.0 * rc_compressed.len() as f64 / data.len() as f64;
-                println!(
-                    "    Range coder: {} → {} bytes ({:.2}%)",
-                    data.len(),
-                    rc_compressed.len(),
-                    rc_ratio
-                );
+                println!("    RC O0:      {} bytes ({:.2}%)", rc_compressed.len(), rc_ratio);
                 
-                // Verify roundtrip
-                let rc_decoded = ssp5_decode_with_range_coder(&rc_compressed).expect("RC decode failed");
-                if rc_decoded != data {
-                    println!("    ERROR: Range coder roundtrip failed!");
+                // Range coder order-1 pipeline
+                let rc1_compressed = ssp5_encode_with_range_coder_o1(&data);
+                let rc1_ratio = 100.0 * rc1_compressed.len() as f64 / data.len() as f64;
+                println!("    RC O1:      {} bytes ({:.2}%)", rc1_compressed.len(), rc1_ratio);
+                
+                // Verify roundtrips
+                let rc_decoded = ssp5_decode_with_range_coder(&rc_compressed);
+                let rc1_decoded = ssp5_decode_with_range_coder_o1(&rc1_compressed);
+                
+                if rc_decoded.as_ref().map_or(false, |d| d == &data) {
+                    println!("    RC O0 roundtrip: OK");
                 } else {
-                    println!("    Range coder roundtrip: OK");
+                    println!("    RC O0 roundtrip: FAILED");
+                }
+                
+                if rc1_decoded.as_ref().map_or(false, |d| d == &data) {
+                    println!("    RC O1 roundtrip: OK");
+                } else {
+                    println!("    RC O1 roundtrip: FAILED");
                 }
             }
             Err(e) => println!("    Error reading {}: {}", path, e),
@@ -71,7 +74,7 @@ fn test_real_data_compression_pipeline() {
     let compressed = ssp5_encode_auto(&data, &s, 16);
     let ratio = 100.0 * compressed.len() as f64 / data.len() as f64;
     println!(
-        "Repetitive 1000 bytes: {} → {} bytes ({:.2}%)",
+        "\nRepetitive 1000 bytes: {} → {} bytes ({:.2}%)",
         data.len(),
         compressed.len(),
         ratio

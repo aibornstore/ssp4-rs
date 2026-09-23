@@ -14,12 +14,14 @@ use super::bwt::{bwt_encode, bwt_decode, pack_bwt, unpack_bwt,
 use super::mtf::{mtf_encode, mtf_decode};
 use super::ssp_codec::{encode as ssp_encode, decode as ssp_decode};
 use super::lz77::{encode as lz77_encode, decode as lz77_decode, Token};
-use super::range_coder::{range_encode_bytes, range_decode_bytes};
+use super::range_coder::{range_encode_bytes, range_decode_bytes, 
+                          range_encode_bytes_order1, range_decode_bytes_order1};
 
 /// Wrapper magic: distinct from SSP5_MAGIC so ssp_decode finds SSP5_MAGIC at ssp_data offset
 const WRAPPER_MAGIC: &[u8; 4] = b"SS5W";
 const WRAPPER_VERSION: u8 = 3; // Version 3 supports chunked BWT
-const WRAPPER_VERSION_RC: u8 = 4; // Version 4 uses range coder instead of SSP
+const WRAPPER_VERSION_RC: u8 = 4; // Version 4 uses range coder (order-0)
+const WRAPPER_VERSION_RC_O1: u8 = 5; // Version 5 uses range coder (order-1 context)
 
 /// Encode data with SSP5 pipeline: BWT → MTF → SSP (no LZ77)
 /// chunk_size: 0 = no chunking, >0 = split into chunks of that size
@@ -259,6 +261,71 @@ pub fn ssp5_decode_with_range_coder(archive: &[u8]) -> Result<Vec<u8>, &'static 
     Ok(bwt_decode(dec_primary, &dec_bwt))
 }
 
+/// Encode data with BWT → MTF → RangeCoder Order-1 pipeline.
+/// Uses order-1 context modeling for better compression than order-0.
+/// Order-1 considers the previous byte when encoding the current byte.
+pub fn ssp5_encode_with_range_coder_o1(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    
+    // BWT → pack(primary + last_col)
+    let (primary, bwt_data) = bwt_encode(data);
+    let bwt_packed = pack_bwt(primary, &bwt_data);
+    
+    // MTF encoding
+    let mtf_data = mtf_encode(&bwt_packed);
+    
+    // Order-1 Range coder encoding
+    let rc_data = range_encode_bytes_order1(&mtf_data);
+    
+    // Archive format v5:
+    // [WRAPPER_MAGIC(4)][VERSION=5(1)][PRIMARY(4)][MTF_LEN(4)][RC_DATA...]
+    let mut out = Vec::with_capacity(13 + rc_data.len());
+    out.extend_from_slice(WRAPPER_MAGIC);
+    out.push(WRAPPER_VERSION_RC_O1);
+    out.extend_from_slice(&(primary as u32).to_le_bytes());
+    out.extend_from_slice(&(mtf_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&rc_data);
+    out
+}
+
+/// Decode data from BWT → MTF → RangeCoder Order-1 pipeline.
+pub fn ssp5_decode_with_range_coder_o1(archive: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if archive.is_empty() {
+        return Ok(Vec::new());
+    }
+    
+    // Check magic and version
+    if &archive[0..4] != WRAPPER_MAGIC {
+        return Err("Invalid wrapper magic");
+    }
+    if archive[4] != WRAPPER_VERSION_RC_O1 {
+        return Err("Invalid wrapper version for order-1 range coder");
+    }
+    
+    let primary = u32::from_le_bytes([archive[5], archive[6], archive[7], archive[8]]) as usize;
+    let mtf_len = u32::from_le_bytes([archive[9], archive[10], archive[11], archive[12]]) as usize;
+    let rc_data = &archive[13..];
+    
+    // Order-1 Range coder decode
+    let mtf_data = range_decode_bytes_order1(rc_data)?;
+    if mtf_data.len() != mtf_len {
+        return Err("MTF length mismatch");
+    }
+    
+    // MTF decode
+    let bwt_decoded = mtf_decode(&mtf_data);
+    
+    // Unpack and BWT decode
+    let (dec_primary, dec_bwt) = unpack_bwt(&bwt_decoded);
+    if dec_primary as u32 != primary as u32 {
+        return Err("BWT primary index mismatch");
+    }
+    
+    Ok(bwt_decode(dec_primary, &dec_bwt))
+}
+
 /// Serialize LZ77 tokens to bytes for BWT processing.
 /// Uses lz77::tokens_to_bytes (Rice-coded format).
 #[allow(dead_code)]
@@ -357,6 +424,56 @@ mod tests {
         // Both should compress well
         assert!(rc_ratio < 15.0, "Range coder should compress well");
         assert!(ssp_ratio < 15.0, "SSP should compress well");
+    }
+    
+    // Order-1 context model tests
+    
+    #[test]
+    fn test_range_coder_o1_roundtrip_small() {
+        let data = b"Hello World! This is a test of range coder.";
+        let encoded = ssp5_encode_with_range_coder_o1(data);
+        let decoded = ssp5_decode_with_range_coder_o1(&encoded).expect("decode should succeed");
+        assert_eq!(data.to_vec(), decoded);
+    }
+    
+    #[test]
+    fn test_range_coder_o1_roundtrip_repeated() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        let encoded = ssp5_encode_with_range_coder_o1(&data);
+        let decoded = ssp5_decode_with_range_coder_o1(&encoded).expect("decode should succeed");
+        assert_eq!(data, decoded);
+    }
+    
+    #[test]
+    fn test_range_coder_o1_compression_ratio() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(5000).copied().collect();
+        let encoded = ssp5_encode_with_range_coder_o1(&data);
+        let ratio = 100.0 * encoded.len() as f64 / data.len() as f64;
+        println!("Range coder O1 compression ratio: {:.2}%", ratio);
+        assert!(ratio < 15.0, "Should compress well: got {}%", ratio);
+    }
+    
+    #[test]
+    fn test_range_coder_o1_vs_o0_compression() {
+        // Compare order-0 vs order-1 on repetitive data
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(5000).copied().collect();
+        
+        let o0_encoded = ssp5_encode_with_range_coder(&data);
+        let o0_ratio = 100.0 * o0_encoded.len() as f64 / data.len() as f64;
+        
+        let o1_encoded = ssp5_encode_with_range_coder_o1(&data);
+        let o1_ratio = 100.0 * o1_encoded.len() as f64 / data.len() as f64;
+        
+        println!("Order-0: {} bytes ({:.2}%)", o0_encoded.len(), o0_ratio);
+        println!("Order-1: {} bytes ({:.2}%)", o1_encoded.len(), o1_ratio);
+        println!("Order-1 improvement: {:.1}pp", o0_ratio - o1_ratio);
+        
+        // Both should be good
+        assert!(o0_ratio < 10.0, "Order-0 should compress well");
+        assert!(o1_ratio < 10.0, "Order-1 should compress well");
     }
     
     #[test]
