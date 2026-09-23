@@ -13,6 +13,7 @@ pub mod real_data_test;
 // Re-exports for convenience
 pub use bit_io::{BitReader, BitWriter, uleb_decode, uleb_encode};
 pub use range_coder::{RangeDecoder, RangeEncoder, range_encode_bytes, range_decode_bytes, range_encode_bytes_order1, range_decode_bytes_order1, range_encode_bytes_order2, range_decode_bytes_order2, range_encode_bytes_order_mix, range_decode_bytes_order_mix, range_encode_bytes_order12_mix, range_decode_bytes_order12_mix, range_encode_bytes_order_ewma, range_decode_bytes_order_ewma, range_encode_bytes_order_ewma3, range_decode_bytes_order_ewma3, range_encode_bytes_order_ewma5, range_decode_bytes_order_ewma5, range_encode_bytes_order_ewma7, range_decode_bytes_order_ewma7};
+pub use ssp5_pipeline::{ssp5_encode_with_range_coder_ewma5_rle, ssp5_decode_with_range_coder_ewma5_rle};
 pub use symbols::{decode_symbol, find_symbol, rank_symbol, unrank_symbol, build_lut};
 pub use ssp_codec::{encode, decode, SSP5_MAGIC, SSP5_VERSION};
 pub use bwt::{bwt_encode, bwt_decode, pack_bwt, unpack_bwt};

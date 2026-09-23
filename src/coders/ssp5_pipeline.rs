@@ -627,6 +627,129 @@ pub fn ssp5_decode_with_range_coder_ewma3(archive: &[u8]) -> Result<Vec<u8>, &'s
     Ok(bwt_decode(dec_primary, &dec_bwt))
 }
 
+// === Run-Length Encoding for MTF output ===
+
+/// RLE escape code (distinct from typical MTF values 0-2)
+const RLE_ESCAPE: u8 = 0xFE;
+/// Minimum run length to encode (2 literal + 1+ encoded)
+const RLE_MIN_RUN: usize = 3;
+
+/// Apply RLE to MTF output. Returns (rle_data, original_len).
+/// Format: runs of 3+ encoded as [ESCAPE, value, run_len-3 as u8].
+/// Literal ESCAPE bytes encoded as [ESCAPE, ESCAPE].
+/// Short runs (<3) pass through as-is.
+fn apply_rle(data: &[u8]) -> (Vec<u8>, u32) {
+    let orig_len = data.len() as u32;
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    
+    while i < data.len() {
+        let b = data[i];
+        
+        // Check for run of same byte
+        let mut run_len = 1;
+        while i + run_len < data.len() && data[i + run_len] == b && run_len < 255 {
+            run_len += 1;
+        }
+        
+        if run_len >= RLE_MIN_RUN && b != RLE_ESCAPE {
+            // Encode as run: ESCAPE + value + (run_len - 3)
+            out.push(RLE_ESCAPE);
+            out.push(b);
+            out.push((run_len - 3) as u8);
+            i += run_len;
+        } else if b == RLE_ESCAPE {
+            // Literal escape: ESCAPE + ESCAPE
+            out.push(RLE_ESCAPE);
+            out.push(RLE_ESCAPE);
+            i += 1;
+        } else {
+            // Literal byte (may be part of a short run, pass through)
+            out.push(b);
+            i += 1;
+        }
+    }
+    
+    (out, orig_len)
+}
+
+/// Reverse RLE encoding. Returns original MTF data.
+fn reverse_rle(data: &[u8], orig_len: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(orig_len as usize);
+    let mut i = 0;
+    
+    while i < data.len() && out.len() < orig_len as usize {
+        let b = data[i];
+        
+        if b == RLE_ESCAPE && i + 1 < data.len() {
+            let next = data[i + 1];
+            if next == RLE_ESCAPE {
+                // Literal ESCAPE
+                out.push(RLE_ESCAPE);
+                i += 2;
+            } else {
+                // Run: ESCAPE + value + count (count is at i+2, value at i+1)
+                let value = data[i + 1];
+                let count = (data[i + 2] as usize) + 3;
+                out.resize(out.len() + count, value);
+                i += 3;
+            }
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    
+    out
+}
+
+/// Encode data with BWT → MTF → RLE → RangeCoder EWMA5 pipeline.
+pub fn ssp5_encode_with_range_coder_ewma5_rle(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    let (primary, bwt_data) = bwt_encode(data);
+    let bwt_packed = pack_bwt(primary, &bwt_data);
+    let mtf_data = mtf_encode(&bwt_packed);
+    let (rle_data, mtf_len) = apply_rle(&mtf_data);
+    let rc_data = range_encode_bytes_order_ewma5(&rle_data);
+    
+    let mut out = Vec::with_capacity(17 + rc_data.len());
+    out.extend_from_slice(WRAPPER_MAGIC);
+    out.push(13); // version: EWMA5 + RLE
+    out.extend_from_slice(&(primary as u32).to_le_bytes());
+    out.extend_from_slice(&(mtf_len as u32).to_le_bytes()); // original MTF length for RLE decode
+    out.extend_from_slice(&rc_data);
+    out
+}
+
+/// Decode data from BWT → MTF → RLE → RangeCoder EWMA5 pipeline.
+pub fn ssp5_decode_with_range_coder_ewma5_rle(archive: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if archive.is_empty() {
+        return Ok(Vec::new());
+    }
+    if &archive[0..4] != WRAPPER_MAGIC {
+        return Err("Invalid wrapper magic");
+    }
+    if archive[4] != 13 {
+        return Err("Invalid wrapper version for EWMA5+RLE");
+    }
+    
+    let primary = u32::from_le_bytes([archive[5], archive[6], archive[7], archive[8]]) as usize;
+    let mtf_len = u32::from_le_bytes([archive[9], archive[10], archive[11], archive[12]]) as usize;
+    let rc_data = &archive[13..];
+    
+    let rle_data = range_decode_bytes_order_ewma5(rc_data)?;
+    let mtf_data = reverse_rle(&rle_data, mtf_len as u32);
+    
+    let bwt_decoded = mtf_decode(&mtf_data);
+    let (dec_primary, dec_bwt) = unpack_bwt(&bwt_decoded);
+    if dec_primary as u32 != primary as u32 {
+        return Err("BWT primary index mismatch");
+    }
+    Ok(bwt_decode(dec_primary, &dec_bwt))
+}
+
 /// Encode data with BWT → MTF → RangeCoder O0+O1+O2+O3+O4+O5+O6+O7 EWMA pipeline.
 pub fn ssp5_encode_with_range_coder_ewma7(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
@@ -1226,5 +1349,88 @@ mod tests {
         println!("RC EWMA (O0+O1+O2): {} bytes", enc_ewma2.len());
         println!("RC EWMA3 (O0+O1+O2+O3): {} bytes", enc_ewma3.len());
         println!("O3 improvement: {:.1}%", 100.0 * (1.0 - enc_ewma3.len() as f64 / enc_ewma2.len() as f64));
+    }
+    
+    // === RLE tests ===
+    
+    #[test]
+    fn test_rle_roundtrip_simple() {
+        let data = b"aaabbbcccdddeee";
+        let (rle, orig_len) = apply_rle(data);
+        let decoded = reverse_rle(&rle, orig_len);
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_rle_roundtrip_no_runs() {
+        let data = b"abcdefghijk";
+        let (rle, orig_len) = apply_rle(data);
+        let decoded = reverse_rle(&rle, orig_len);
+        assert_eq!(decoded, data);
+        assert_eq!(rle, data); // No compression, should be same
+    }
+    
+    #[test]
+    fn test_rle_roundtrip_mixed() {
+        // Typical MTF-like data: runs of 0s with occasional other values
+        let data: Vec<u8> = vec![
+            0, 0, 0, 0, 5, 5, 5, 5, 5, 5, 5,
+            1, 1, 1, 1, 1, 1, 1,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            2, 2, 2, 2,
+        ];
+        let (rle, orig_len) = apply_rle(&data);
+        let decoded = reverse_rle(&rle, orig_len);
+        assert_eq!(decoded, data);
+        println!("MTF-like: {} bytes -> {} RLE bytes ({:.1}%)", 
+            data.len(), rle.len(), 100.0 * rle.len() as f64 / data.len() as f64);
+    }
+    
+    #[test]
+    fn test_rle_roundtrip_escape_literal() {
+        // Data containing the escape byte (0xFE)
+        let data = vec![0xFE, 0xFE, 0xFE, 0xFE, 0xFE];
+        let (rle, orig_len) = apply_rle(&data);
+        let decoded = reverse_rle(&rle, orig_len);
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_rle_short_runs() {
+        // Runs shorter than MIN_RUN (3) should pass through
+        let data = b"aab"; // 2 'a's, not a run (MIN_RUN=3)
+        let (rle, orig_len) = apply_rle(data);
+        let decoded = reverse_rle(&rle, orig_len);
+        assert_eq!(decoded, data);
+    }
+    
+    // === EWMA5 + RLE pipeline tests ===
+    
+    #[test]
+    fn test_ewma5_rle_roundtrip_small() {
+        let data = b"hello world";
+        let encoded = ssp5_encode_with_range_coder_ewma5_rle(data);
+        let decoded = ssp5_decode_with_range_coder_ewma5_rle(&encoded).expect("decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_ewma5_rle_roundtrip_repetitive() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        let encoded = ssp5_encode_with_range_coder_ewma5_rle(&data);
+        let decoded = ssp5_decode_with_range_coder_ewma5_rle(&encoded).expect("decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_ewma5_rle_vs_ewma5_compression() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        let enc_ewma5 = ssp5_encode_with_range_coder_ewma5(&data);
+        let enc_rle = ssp5_encode_with_range_coder_ewma5_rle(&data);
+        println!("EWMA5: {} bytes", enc_ewma5.len());
+        println!("EWMA5+RLE: {} bytes", enc_rle.len());
+        println!("RLE improvement: {:.1}%", 100.0 * (1.0 - enc_rle.len() as f64 / enc_ewma5.len() as f64));
     }
 }

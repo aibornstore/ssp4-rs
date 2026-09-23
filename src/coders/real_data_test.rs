@@ -8,7 +8,8 @@ use super::ssp5_pipeline::{ssp5_encode_auto, ssp5_encode, ssp5_decode,
                            ssp5_encode_with_range_coder_ewma, ssp5_decode_with_range_coder_ewma,
                            ssp5_encode_with_range_coder_ewma3, ssp5_decode_with_range_coder_ewma3,
                            ssp5_encode_with_range_coder_ewma5, ssp5_decode_with_range_coder_ewma5,
-                           ssp5_encode_with_range_coder_ewma7, ssp5_decode_with_range_coder_ewma7};
+                           ssp5_encode_with_range_coder_ewma7, ssp5_decode_with_range_coder_ewma7,
+                           ssp5_encode_with_range_coder_ewma5_rle, ssp5_decode_with_range_coder_ewma5_rle};
 use std::fs;
 
 fn test_real_data_compression() {
@@ -84,6 +85,11 @@ fn test_real_data_compression() {
                 let ewma7_ratio = 100.0 * ewma7_compressed.len() as f64 / data.len() as f64;
                 println!("    RC EWMA7:   {} bytes ({:.2}%)", ewma7_compressed.len(), ewma7_ratio);
                 
+                // Range coder EWMA5 + RLE pipeline
+                let ewma5rle_compressed = ssp5_encode_with_range_coder_ewma5_rle(&data);
+                let ewma5rle_ratio = 100.0 * ewma5rle_compressed.len() as f64 / data.len() as f64;
+                println!("    RC EWMA5+RLE: {} bytes ({:.2}%)", ewma5rle_compressed.len(), ewma5rle_ratio);
+                
                 // Verify roundtrips
                 let rc_decoded = ssp5_decode_with_range_coder(&rc_compressed);
                 let rc1_decoded = ssp5_decode_with_range_coder_o1(&rc1_compressed);
@@ -147,6 +153,13 @@ fn test_real_data_compression() {
                     println!("    RC EWMA7 roundtrip: OK");
                 } else {
                     println!("    RC EWMA7 roundtrip: FAILED");
+                }
+                
+                let ewma5rle_decoded = ssp5_decode_with_range_coder_ewma5_rle(&ewma5rle_compressed);
+                if ewma5rle_decoded.as_ref().map_or(false, |d| d == &data) {
+                    println!("    RC EWMA5+RLE roundtrip: OK");
+                } else {
+                    println!("    RC EWMA5+RLE roundtrip: FAILED");
                 }
             }
             Err(e) => println!("    Error reading {}: {}", path, e),
