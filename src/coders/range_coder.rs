@@ -628,10 +628,278 @@ pub fn range_decode_bytes_order12_mix(data: &[u8]) -> Result<Vec<u8>, &'static s
     Ok(out)
 }
 
-/// Adaptive order-0/1/2 mixing with EWMA-based model weighting.
-/// Each model (O0, O1, O2) has a reliability score updated via EWMA.
-/// Models with lower prediction error get higher weight in blending.
+/// Adaptive order-0/1/2/3 mixing with EWMA-based model weighting.
+/// Each model (O0, O1, O2, O3) has a reliability score updated via EWMA.
+/// O3 uses a fixed sparse table (65K entries) for deterministic encoder/decoder sync.
 const EWMA_ALPHA: f64 = 0.1; // Smoothing factor for EWMA
+const O3_TABLE_SIZE: usize = 1 << 16; // 65536 fixed slots — no HashMap divergence
+const O3_MIN_SAMPLES: u64 = 10; // Minimum samples before O3 contributes
+
+fn o3_hash(p1: u8, p2: u8, p3: u8) -> usize {
+    let x = (p1 as u32) ^ ((p2 as u32) << 8) ^ ((p3 as u32) << 16);
+    let mut h = x.wrapping_mul(0x45d9f3b);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x45d9f3b);
+    (h as usize) & (O3_TABLE_SIZE - 1)
+}
+
+pub fn range_encode_bytes_order_ewma3(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        let mut out = Vec::new();
+        out.push(7); // flag: O0+O1+O2+O3 EWMA
+        out.push(0); out.push(0); out.push(0); out.push(0);
+        return out;
+    }
+    
+    let mut enc = RangeEncoder::new();
+    
+    // O0 model
+    let mut o0_freqs = [1u64; 256];
+    let mut o0_total: u64 = 256;
+    
+    // O1 model
+    let mut o1_freqs = [[1u64; 256]; 256];
+    let mut o1_totals = [256u64; 256];
+    
+    // O2 model
+    let mut o2_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; 256 * 256];
+    let mut o2_totals: Vec<u64> = vec![256u64; 256 * 256];
+    
+    // O3 model - sparse fixed table (65K entries)
+    let mut o3_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; O3_TABLE_SIZE];
+    let mut o3_totals: Vec<u64> = vec![256u64; O3_TABLE_SIZE];
+    
+    // EWMA error tracking
+    let mut o0_err: f64 = 0.5;
+    let mut o1_err: f64 = 0.5;
+    let mut o2_err: f64 = 0.5;
+    let mut o3_err: f64 = 0.5;
+    
+    let mut prev1 = 0u8;
+    let mut prev2 = 0u8;
+    let mut prev3 = 0u8;
+    
+    for &b in data {
+        let sym = b as usize;
+        let o1_ctx = prev1 as usize;
+        let o2_ctx = (prev1 as usize) * 256 + (prev2 as usize);
+        let o3_idx = o3_hash(prev1, prev2, prev3);
+        
+        // Get O3 frequencies
+        let o3_total = o3_totals[o3_idx];
+        let o3_reliable = o3_total >= O3_MIN_SAMPLES;
+        
+        // Compute inverse-error weights
+        let inv_o0 = 1.0 / (o0_err + 0.001);
+        let inv_o1 = 1.0 / (o1_err + 0.001);
+        let inv_o2 = 1.0 / (o2_err + 0.001);
+        let inv_o3 = if o3_reliable { 1.0 / (o3_err + 0.001) } else { 0.001 };
+        let inv_sum = inv_o0 + inv_o1 + inv_o2 + inv_o3;
+        
+        let w0 = ((inv_o0 / inv_sum) * 100.0) as u64;
+        let w1 = ((inv_o1 / inv_sum) * 100.0) as u64;
+        let w2 = ((inv_o2 / inv_sum) * 100.0) as u64;
+        let w3 = ((inv_o3 / inv_sum) * 100.0) as u64;
+        
+        // Cumulative frequencies
+        let o0_cum: u64 = o0_freqs[..sym].iter().sum();
+        let o1_cum: u64 = o1_freqs[o1_ctx][..sym].iter().sum();
+        let o2_cum: u64 = o2_freqs[o2_ctx][..sym].iter().sum();
+        let o3_cum: u64 = o3_freqs[o3_idx][..sym].iter().sum();
+        
+        let mixed_cum = o0_cum * w0 + o1_cum * w1 + o2_cum * w2 + o3_cum * w3;
+        
+        let o0_count = o0_freqs[sym];
+        let o1_count = o1_freqs[o1_ctx][sym];
+        let o2_count = o2_freqs[o2_ctx][sym];
+        let o3_count = o3_freqs[o3_idx][sym];
+        
+        let mixed_count = o0_count * w0 + o1_count * w1 + o2_count * w2 + o3_count * w3;
+        let mixed_total = o0_total * w0 + o1_totals[o1_ctx] * w1 
+            + o2_totals[o2_ctx] * w2 + o3_total * w3;
+        
+        // Encode
+        let total = mixed_total.max(1);
+        let cum = mixed_cum.min(total - 1);
+        let freq = mixed_count.max(1).min(total - cum);
+        
+        enc.encode(cum, freq, total);
+        
+        // Update errors
+        let actual_prob = freq as f64 / total as f64;
+        let symbol_prob = 1.0 / 256.0;
+        let o0_err_delta = (actual_prob - symbol_prob).abs();
+        let o1_err_delta = (actual_prob - o1_freqs[o1_ctx][sym] as f64 / o1_totals[o1_ctx] as f64).abs();
+        let o2_err_delta = (actual_prob - o2_freqs[o2_ctx][sym] as f64 / o2_totals[o2_ctx] as f64).abs();
+        let o3_err_delta = if o3_reliable {
+            (actual_prob - o3_count as f64 / o3_total as f64).abs()
+        } else {
+            0.5 // Neutral error when O3 not reliable
+        };
+        
+        o0_err = (1.0 - EWMA_ALPHA) * o0_err + EWMA_ALPHA * o0_err_delta;
+        o1_err = (1.0 - EWMA_ALPHA) * o1_err + EWMA_ALPHA * o1_err_delta;
+        o2_err = (1.0 - EWMA_ALPHA) * o2_err + EWMA_ALPHA * o2_err_delta;
+        o3_err = (1.0 - EWMA_ALPHA) * o3_err + EWMA_ALPHA * o3_err_delta;
+        
+        // Update all models
+        o0_freqs[sym] += 1;
+        o0_total += 1;
+        o1_freqs[o1_ctx][sym] += 1;
+        o1_totals[o1_ctx] += 1;
+        o2_freqs[o2_ctx][sym] += 1;
+        o2_totals[o2_ctx] += 1;
+        
+        // Update O3 model
+        o3_freqs[o3_idx][sym] += 1;
+        o3_totals[o3_idx] += 1;
+        
+        prev3 = prev2;
+        prev2 = prev1;
+        prev1 = b;
+    }
+    
+    let mut out = Vec::new();
+    out.push(7); // flag: O0+O1+O2+O3 EWMA
+    
+    let len = data.len() as u32;
+    out.extend_from_slice(&len.to_le_bytes());
+    
+    out.extend(enc.flush());
+    out
+}
+
+/// Decode data encoded with O0+O1+O2+O3 EWMA mixing.
+pub fn range_decode_bytes_order_ewma3(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if data.len() < 5 {
+        return Err("Range decode: data too short");
+    }
+    
+    let flag = data[0];
+    if flag != 7 {
+        return Err("Range decode: not O0+O1+O2+O3 EWMA encoded");
+    }
+    
+    let count = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+    let range_data = &data[5..];
+    
+    let mut dec = RangeDecoder::new(range_data);
+    let mut out = Vec::with_capacity(count);
+    
+    let mut o0_freqs = [1u64; 256];
+    let mut o0_total: u64 = 256;
+    let mut o1_freqs = [[1u64; 256]; 256];
+    let mut o1_totals = [256u64; 256];
+    let mut o2_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; 256 * 256];
+    let mut o2_totals: Vec<u64> = vec![256u64; 256 * 256];
+    let mut o3_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; O3_TABLE_SIZE];
+    let mut o3_totals: Vec<u64> = vec![256u64; O3_TABLE_SIZE];
+    
+    let mut o0_err: f64 = 0.5;
+    let mut o1_err: f64 = 0.5;
+    let mut o2_err: f64 = 0.5;
+    let mut o3_err: f64 = 0.5;
+    
+    let mut prev1 = 0u8;
+    let mut prev2 = 0u8;
+    let mut prev3 = 0u8;
+    
+    for _ in 0..count {
+        let o1_ctx = prev1 as usize;
+        let o2_ctx = (prev1 as usize) * 256 + (prev2 as usize);
+        let o3_idx = o3_hash(prev1, prev2, prev3);
+        
+        let o3_total = o3_totals[o3_idx];
+        let o3_reliable = o3_total >= O3_MIN_SAMPLES;
+        
+        let inv_o0 = 1.0 / (o0_err + 0.001);
+        let inv_o1 = 1.0 / (o1_err + 0.001);
+        let inv_o2 = 1.0 / (o2_err + 0.001);
+        let inv_o3 = if o3_reliable { 1.0 / (o3_err + 0.001) } else { 0.001 };
+        let inv_sum = inv_o0 + inv_o1 + inv_o2 + inv_o3;
+        
+        let w0 = ((inv_o0 / inv_sum) * 100.0) as u64;
+        let w1 = ((inv_o1 / inv_sum) * 100.0) as u64;
+        let w2 = ((inv_o2 / inv_sum) * 100.0) as u64;
+        let w3 = ((inv_o3 / inv_sum) * 100.0) as u64;
+        
+        let mixed_total = o0_total * w0 + o1_totals[o1_ctx] * w1 
+            + o2_totals[o2_ctx] * w2 + o3_total * w3;
+        let f = dec.get_freq(mixed_total.max(1));
+        
+        // Find symbol
+        let mut sym = 0u8;
+        let mut cum = 0u64;
+        
+        for s in 0..256 {
+            let o0_cum = o0_freqs[..s].iter().sum::<u64>();
+            let o1_cum = o1_freqs[o1_ctx][..s].iter().sum::<u64>();
+            let o2_cum = o2_freqs[o2_ctx][..s].iter().sum::<u64>();
+            let o3_cum = o3_freqs[o3_idx][..s].iter().sum::<u64>();
+            
+            let next_cum = o0_cum * w0 + o1_cum * w1 + o2_cum * w2 + o3_cum * w3
+                + o0_freqs[s] * w0 + o1_freqs[o1_ctx][s] * w1 
+                + o2_freqs[o2_ctx][s] * w2 + o3_freqs[o3_idx][s] * w3;
+            
+            if cum <= f && f < next_cum {
+                sym = s as u8;
+                break;
+            }
+            cum = next_cum;
+        }
+        
+        let o0_cum = o0_freqs[..sym as usize].iter().sum::<u64>();
+        let o1_cum = o1_freqs[o1_ctx][..sym as usize].iter().sum::<u64>();
+        let o2_cum = o2_freqs[o2_ctx][..sym as usize].iter().sum::<u64>();
+        let o3_cum = o3_freqs[o3_idx][..sym as usize].iter().sum::<u64>();
+        
+        let dec_cum = o0_cum * w0 + o1_cum * w1 + o2_cum * w2 + o3_cum * w3;
+        let dec_freq = o0_freqs[sym as usize] * w0 + o1_freqs[o1_ctx][sym as usize] * w1 
+            + o2_freqs[o2_ctx][sym as usize] * w2 
+            + o3_freqs[o3_idx][sym as usize] * w3;
+        
+        dec.decode(dec_cum, dec_freq.max(1), mixed_total.max(1));
+        
+        out.push(sym);
+        
+        // Update errors
+        let total = mixed_total.max(1);
+        let actual_prob = dec_freq as f64 / total as f64;
+        let symbol_prob = 1.0 / 256.0;
+        let o0_err_delta = (actual_prob - symbol_prob).abs();
+        let o1_err_delta = (actual_prob - o1_freqs[o1_ctx][sym as usize] as f64 / o1_totals[o1_ctx] as f64).abs();
+        let o2_err_delta = (actual_prob - o2_freqs[o2_ctx][sym as usize] as f64 / o2_totals[o2_ctx].max(1) as f64).abs();
+        let o3_err_delta = if o3_reliable {
+            let o3_count_val = o3_freqs[o3_idx][sym as usize];
+            let o3_total_val = o3_totals[o3_idx];
+            (actual_prob - o3_count_val as f64 / o3_total_val.max(1) as f64).abs()
+        } else {
+            0.5
+        };
+        
+        o0_err = (1.0 - EWMA_ALPHA) * o0_err + EWMA_ALPHA * o0_err_delta;
+        o1_err = (1.0 - EWMA_ALPHA) * o1_err + EWMA_ALPHA * o1_err_delta;
+        o2_err = (1.0 - EWMA_ALPHA) * o2_err + EWMA_ALPHA * o2_err_delta;
+        o3_err = (1.0 - EWMA_ALPHA) * o3_err + EWMA_ALPHA * o3_err_delta;
+        
+        // Update models
+        o0_freqs[sym as usize] += 1;
+        o0_total += 1;
+        o1_freqs[o1_ctx][sym as usize] += 1;
+        o1_totals[o1_ctx] += 1;
+        o2_freqs[o2_ctx][sym as usize] += 1;
+        o2_totals[o2_ctx] += 1;
+        
+        o3_freqs[o3_idx][sym as usize] += 1;
+        o3_totals[o3_idx] += 1;
+        
+        prev3 = prev2;
+        prev2 = prev1;
+        prev1 = sym;
+    }
+    
+    Ok(out)
+}
 
 pub fn range_encode_bytes_order_ewma(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
@@ -1298,5 +1566,61 @@ mod tests {
         println!("Order-0+1 mix: {} bytes", enc_mix.len());
         println!("Order-EWMA (O0+O1+O2): {} bytes", enc_ewma.len());
         println!("EWMA vs mix: {:.1}%", 100.0 * (1.0 - enc_ewma.len() as f64 / enc_mix.len() as f64));
+    }
+    
+    // === Order-3 EWMA tests (sparse table) ===
+    
+    #[test]
+    fn test_order_ewma3_roundtrip_simple() {
+        let data = b"hello world";
+        let encoded = range_encode_bytes_order_ewma3(data);
+        let decoded = range_decode_bytes_order_ewma3(&encoded).expect("range decode O3 should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_order_ewma3_roundtrip_repetitive() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        let encoded = range_encode_bytes_order_ewma3(&data);
+        let decoded = range_decode_bytes_order_ewma3(&encoded).expect("range decode O3 should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_order_ewma3_roundtrip_empty() {
+        let data: Vec<u8> = vec![];
+        let encoded = range_encode_bytes_order_ewma3(&data);
+        let decoded = range_decode_bytes_order_ewma3(&encoded).expect("range decode O3 empty should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_order_ewma3_roundtrip_random() {
+        // Generate deterministic pseudo-random data via LCG
+        let seed: u64 = 42;
+        let mut data = Vec::with_capacity(500);
+        let mut h = seed;
+        for _ in 0..500 {
+            h = h.wrapping_mul(6364136223846793005).wrapping_add(1);
+            data.push((h >> 40) as u8);
+        }
+        
+        let encoded = range_encode_bytes_order_ewma3(&data);
+        let decoded = range_decode_bytes_order_ewma3(&encoded).expect("range decode O3 random should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_order_ewma3_vs_ewma2() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        
+        let enc_ewma2 = range_encode_bytes_order_ewma(&data);
+        let enc_ewma3 = range_encode_bytes_order_ewma3(&data);
+        
+        println!("Order-EWMA (O0+O1+O2): {} bytes", enc_ewma2.len());
+        println!("Order-EWMA (O0+O1+O2+O3): {} bytes", enc_ewma3.len());
+        println!("O3 vs O2: {:.1}%", 100.0 * (1.0 - enc_ewma3.len() as f64 / enc_ewma2.len() as f64));
     }
 }

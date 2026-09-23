@@ -19,7 +19,8 @@ use super::range_coder::{range_encode_bytes, range_decode_bytes,
                           range_encode_bytes_order2, range_decode_bytes_order2,
                           range_encode_bytes_order_mix, range_decode_bytes_order_mix,
                           range_encode_bytes_order12_mix, range_decode_bytes_order12_mix,
-                          range_encode_bytes_order_ewma, range_decode_bytes_order_ewma};
+                          range_encode_bytes_order_ewma, range_decode_bytes_order_ewma,
+                          range_encode_bytes_order_ewma3, range_decode_bytes_order_ewma3};
 
 /// Wrapper magic: distinct from SSP5_MAGIC so ssp_decode finds SSP5_MAGIC at ssp_data offset
 const WRAPPER_MAGIC: &[u8; 4] = b"SS5W";
@@ -515,6 +516,8 @@ pub fn ssp5_decode_with_range_coder_o12(archive: &[u8]) -> Result<Vec<u8>, &'sta
     Ok(bwt_decode(dec_primary, &dec_bwt))
 }
 
+const WRAPPER_VERSION_RC_EWMA3: u8 = 10; // Version 10 uses range coder (O0+O1+O2+O3 EWMA)
+
 /// Encode data with BWT → MTF → RangeCoder O0+O1+O2 EWMA pipeline.
 /// Adaptively blends O0, O1, O2 with EWMA-based model weighting.
 pub fn ssp5_encode_with_range_coder_ewma(data: &[u8]) -> Vec<u8> {
@@ -555,6 +558,58 @@ pub fn ssp5_decode_with_range_coder_ewma(archive: &[u8]) -> Result<Vec<u8>, &'st
     let rc_data = &archive[13..];
     
     let mtf_data = range_decode_bytes_order_ewma(rc_data)?;
+    if mtf_data.len() != mtf_len {
+        return Err("MTF length mismatch");
+    }
+    
+    let bwt_decoded = mtf_decode(&mtf_data);
+    let (dec_primary, dec_bwt) = unpack_bwt(&bwt_decoded);
+    if dec_primary as u32 != primary as u32 {
+        return Err("BWT primary index mismatch");
+    }
+    
+    Ok(bwt_decode(dec_primary, &dec_bwt))
+}
+
+/// Encode data with BWT → MTF → RangeCoder O0+O1+O2+O3 EWMA pipeline (sparse table).
+pub fn ssp5_encode_with_range_coder_ewma3(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    
+    let (primary, bwt_data) = bwt_encode(data);
+    let bwt_packed = pack_bwt(primary, &bwt_data);
+    let mtf_data = mtf_encode(&bwt_packed);
+    
+    let rc_data = range_encode_bytes_order_ewma3(&mtf_data);
+    
+    let mut out = Vec::with_capacity(13 + rc_data.len());
+    out.extend_from_slice(WRAPPER_MAGIC);
+    out.push(WRAPPER_VERSION_RC_EWMA3);
+    out.extend_from_slice(&(primary as u32).to_le_bytes());
+    out.extend_from_slice(&(mtf_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&rc_data);
+    out
+}
+
+/// Decode data from BWT → MTF → RangeCoder O0+O1+O2+O3 EWMA pipeline (sparse table).
+pub fn ssp5_decode_with_range_coder_ewma3(archive: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if archive.is_empty() {
+        return Ok(Vec::new());
+    }
+    
+    if &archive[0..4] != WRAPPER_MAGIC {
+        return Err("Invalid wrapper magic");
+    }
+    if archive[4] != WRAPPER_VERSION_RC_EWMA3 {
+        return Err("Invalid wrapper version for EWMA3 range coder");
+    }
+    
+    let primary = u32::from_le_bytes([archive[5], archive[6], archive[7], archive[8]]) as usize;
+    let mtf_len = u32::from_le_bytes([archive[9], archive[10], archive[11], archive[12]]) as usize;
+    let rc_data = &archive[13..];
+    
+    let mtf_data = range_decode_bytes_order_ewma3(rc_data)?;
     if mtf_data.len() != mtf_len {
         return Err("MTF length mismatch");
     }
@@ -1022,5 +1077,50 @@ mod tests {
         println!("100k sized: enc={} dec={}", enc.len(), dec.len());
         assert_eq!(data.len(), dec.len(), "100k roundtrip length mismatch");
         assert_eq!(&data[..], &dec[..], "100k roundtrip data mismatch");
+    }
+    
+    // === O0+O1+O2+O3 EWMA pipeline (sparse table) ===
+    
+    #[test]
+    fn test_range_coder_ewma3_roundtrip_small() {
+        let data = b"hello world";
+        let encoded = ssp5_encode_with_range_coder_ewma3(data);
+        let decoded = ssp5_decode_with_range_coder_ewma3(&encoded).expect("decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_range_coder_ewma3_roundtrip_repetitive() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        let encoded = ssp5_encode_with_range_coder_ewma3(&data);
+        let decoded = ssp5_decode_with_range_coder_ewma3(&encoded).expect("decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_range_coder_ewma3_roundtrip_random() {
+        // Deterministic pseudo-random data
+        let seed: u64 = 42;
+        let mut data = Vec::with_capacity(1000);
+        let mut h = seed;
+        for _ in 0..1000 {
+            h = h.wrapping_mul(6364136223846793005).wrapping_add(1);
+            data.push((h >> 40) as u8);
+        }
+        let encoded = ssp5_encode_with_range_coder_ewma3(&data);
+        let decoded = ssp5_decode_with_range_coder_ewma3(&encoded).expect("decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_range_coder_ewma3_vs_ewma_compression() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        let enc_ewma2 = ssp5_encode_with_range_coder_ewma(&data);
+        let enc_ewma3 = ssp5_encode_with_range_coder_ewma3(&data);
+        println!("RC EWMA (O0+O1+O2): {} bytes", enc_ewma2.len());
+        println!("RC EWMA3 (O0+O1+O2+O3): {} bytes", enc_ewma3.len());
+        println!("O3 improvement: {:.1}%", 100.0 * (1.0 - enc_ewma3.len() as f64 / enc_ewma2.len() as f64));
     }
 }
