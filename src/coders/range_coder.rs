@@ -474,6 +474,160 @@ pub fn range_decode_bytes_order2(data: &[u8]) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
+/// Adaptive order-1+2 mixing range coder.
+/// Blends O1 and O2 predictions with adaptive weighting based on context reliability.
+/// O2 has more context (2 prev bytes) but sparser statistics.
+/// Weight adapts: more weight to O2 when its context is well-populated.
+pub fn range_encode_bytes_order12_mix(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        let mut out = Vec::new();
+        out.push(4); // flag: order-1+2 mix
+        out.push(0); out.push(0); out.push(0); out.push(0); // length = 0
+        return out;
+    }
+    
+    let mut enc = RangeEncoder::new();
+    
+    // Order-1 model: [context][symbol] = frequency
+    let mut o1_freqs = [[1u64; 256]; 256];
+    let mut o1_totals = [256u64; 256];
+    
+    // Order-2 model: [context][symbol] = frequency, context = prev1 * 256 + prev2
+    let mut o2_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; 256 * 256];
+    let mut o2_totals: Vec<u64> = vec![256u64; 256 * 256];
+    
+    let mut prev1 = 0u8;
+    let mut prev2 = 0u8;
+    
+    // Reliability thresholds for adaptive weighting
+    let o2_reliable_threshold: u64 = 50; // O2 context is reliable if seen 50+ symbols
+    
+    for &b in data {
+        let sym = b as usize;
+        let o1_ctx = prev1 as usize;
+        let o2_ctx = (prev1 as usize) * 256 + (prev2 as usize);
+        
+        // Adaptive weight based on O2 context reliability
+        let o2_reliability = o2_totals[o2_ctx].min(o1_totals[o1_ctx] * 2);
+        let weight = if o2_reliability >= o2_reliable_threshold {
+            2u64 // O2 is reliable: weight 2:1
+        } else {
+            1u64 // O2 not reliable yet: equal weight
+        };
+        
+        // Mixed cumulative frequency
+        let o1_cum: u64 = o1_freqs[o1_ctx][..sym].iter().sum();
+        let o2_cum: u64 = o2_freqs[o2_ctx][..sym].iter().sum();
+        let mixed_cum = o1_cum + o2_cum * weight;
+        
+        // Mixed symbol frequency
+        let o1_count = o1_freqs[o1_ctx][sym];
+        let o2_count = o2_freqs[o2_ctx][sym];
+        let mixed_count = o1_count + o2_count * weight;
+        
+        // Mixed total
+        let mixed_total = o1_totals[o1_ctx] + o2_totals[o2_ctx] * weight;
+        
+        // Encode
+        let total = mixed_total.max(1);
+        let cum = mixed_cum.min(total - 1);
+        let freq = mixed_count.max(1).min(total - cum);
+        
+        enc.encode(cum, freq, total);
+        
+        // Update models
+        o1_freqs[o1_ctx][sym] += 1;
+        o1_totals[o1_ctx] += 1;
+        o2_freqs[o2_ctx][sym] += 1;
+        o2_totals[o2_ctx] += 1;
+        
+        prev2 = prev1;
+        prev1 = b;
+    }
+    
+    let mut out = Vec::new();
+    out.push(4); // flag: order-1+2 mix
+    
+    let len = data.len() as u32;
+    out.extend_from_slice(&len.to_le_bytes());
+    
+    out.extend(enc.flush());
+    out
+}
+
+/// Decode data encoded with adaptive O1+O2 mixing.
+pub fn range_decode_bytes_order12_mix(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if data.len() < 5 {
+        return Err("Range decode: data too short");
+    }
+    
+    let flag = data[0];
+    if flag != 4 {
+        return Err("Range decode: not order-1+2 mix encoded");
+    }
+    
+    let count = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+    let range_data = &data[5..];
+    
+    let mut dec = RangeDecoder::new(range_data);
+    let mut out = Vec::with_capacity(count);
+    
+    let mut o1_freqs = [[1u64; 256]; 256];
+    let mut o1_totals = [256u64; 256];
+    let mut o2_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; 256 * 256];
+    let mut o2_totals: Vec<u64> = vec![256u64; 256 * 256];
+    
+    let mut prev1 = 0u8;
+    let mut prev2 = 0u8;
+    let o2_reliable_threshold: u64 = 50;
+    
+    for _ in 0..count {
+        let o1_ctx = prev1 as usize;
+        let o2_ctx = (prev1 as usize) * 256 + (prev2 as usize);
+        
+        let o2_reliability = o2_totals[o2_ctx].min(o1_totals[o1_ctx] * 2);
+        let weight = if o2_reliability >= o2_reliable_threshold { 2 } else { 1 };
+        
+        let mixed_total = o1_totals[o1_ctx] + o2_totals[o2_ctx] * weight;
+        let f = dec.get_freq(mixed_total.max(1));
+        
+        // Find symbol
+        let mut sym = 0u8;
+        let mut cum = 0u64;
+        
+        for s in 0..256 {
+            let o1_cum = o1_freqs[o1_ctx][..s].iter().sum::<u64>();
+            let o2_cum = o2_freqs[o2_ctx][..s].iter().sum::<u64>();
+            let next_cum = o1_cum + o2_cum * weight + o1_freqs[o1_ctx][s] + o2_freqs[o2_ctx][s] * weight;
+            
+            if cum <= f && f < next_cum {
+                sym = s as u8;
+                break;
+            }
+            cum = next_cum;
+        }
+        
+        let o1_cum = o1_freqs[o1_ctx][..sym as usize].iter().sum::<u64>();
+        let o2_cum = o2_freqs[o2_ctx][..sym as usize].iter().sum::<u64>();
+        let dec_cum = o1_cum + o2_cum * weight;
+        let dec_freq = o1_freqs[o1_ctx][sym as usize] + o2_freqs[o2_ctx][sym as usize] * weight;
+        
+        dec.decode(dec_cum, dec_freq.max(1), mixed_total.max(1));
+        
+        out.push(sym);
+        
+        o1_freqs[o1_ctx][sym as usize] += 1;
+        o1_totals[o1_ctx] += 1;
+        o2_freqs[o2_ctx][sym as usize] += 1;
+        o2_totals[o2_ctx] += 1;
+        
+        prev2 = prev1;
+        prev1 = sym;
+    }
+    
+    Ok(out)
+}
+
 /// Adaptive order-0/1 mixing range coder.
 /// Blends order-0 and order-1 probability estimates using weighted integer arithmetic.
 /// O1 frequencies get WEIGHT multiplier for better text compression.
@@ -859,5 +1013,49 @@ mod tests {
         println!("Order-0: {} bytes", enc_order0.len());
         println!("Order-mix: {} bytes", enc_mix.len());
         println!("Mix vs O0: {:.1}%", 100.0 * (1.0 - enc_mix.len() as f64 / enc_order0.len() as f64));
+    }
+    
+    // Order-1+2 mix tests
+    
+    #[test]
+    fn test_order12_mix_roundtrip_simple() {
+        let data = b"hello world";
+        let encoded = range_encode_bytes_order12_mix(data);
+        let decoded = range_decode_bytes_order12_mix(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_order12_mix_roundtrip_repetitive() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        let encoded = range_encode_bytes_order12_mix(&data);
+        let decoded = range_decode_bytes_order12_mix(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_order12_mix_vs_order2() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        
+        let enc_o2 = range_encode_bytes_order2(&data);
+        let enc_o12 = range_encode_bytes_order12_mix(&data);
+        
+        println!("Order-2: {} bytes", enc_o2.len());
+        println!("Order-1+2 mix: {} bytes", enc_o12.len());
+        println!("O1+2 vs O2: {:.1}%", 100.0 * (1.0 - enc_o12.len() as f64 / enc_o2.len() as f64));
+    }
+    
+    #[test]
+    fn test_order12_mix_vs_order_mix() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        
+        let enc_o01 = range_encode_bytes_order_mix(&data);
+        let enc_o12 = range_encode_bytes_order12_mix(&data);
+        
+        println!("Order-0+1 mix: {} bytes", enc_o01.len());
+        println!("Order-1+2 mix: {} bytes", enc_o12.len());
     }
 }

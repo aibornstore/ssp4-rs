@@ -3,7 +3,8 @@ use super::ssp5_pipeline::{ssp5_encode_auto, ssp5_encode, ssp5_decode,
                            ssp5_encode_with_range_coder, ssp5_decode_with_range_coder,
                            ssp5_encode_with_range_coder_o1, ssp5_decode_with_range_coder_o1,
                            ssp5_encode_with_range_coder_o2, ssp5_decode_with_range_coder_o2,
-                           ssp5_encode_with_range_coder_mix, ssp5_decode_with_range_coder_mix};
+                           ssp5_encode_with_range_coder_mix, ssp5_decode_with_range_coder_mix,
+                           ssp5_encode_with_range_coder_o12, ssp5_decode_with_range_coder_o12};
 use std::fs;
 
 fn test_real_data_compression() {
@@ -54,6 +55,11 @@ fn test_real_data_compression() {
                 let rcm_ratio = 100.0 * rcm_compressed.len() as f64 / data.len() as f64;
                 println!("    RC MIX:     {} bytes ({:.2}%)", rcm_compressed.len(), rcm_ratio);
                 
+                // Range coder order-1+2 mix pipeline
+                let rc12_compressed = ssp5_encode_with_range_coder_o12(&data);
+                let rc12_ratio = 100.0 * rc12_compressed.len() as f64 / data.len() as f64;
+                println!("    RC O1+2:    {} bytes ({:.2}%)", rc12_compressed.len(), rc12_ratio);
+                
                 // Verify roundtrips
                 let rc_decoded = ssp5_decode_with_range_coder(&rc_compressed);
                 let rc1_decoded = ssp5_decode_with_range_coder_o1(&rc1_compressed);
@@ -82,6 +88,13 @@ fn test_real_data_compression() {
                     println!("    RC MIX roundtrip: OK");
                 } else {
                     println!("    RC MIX roundtrip: FAILED");
+                }
+                
+                let rc12_decoded = ssp5_decode_with_range_coder_o12(&rc12_compressed);
+                if rc12_decoded.as_ref().map_or(false, |d| d == &data) {
+                    println!("    RC O1+2 roundtrip: OK");
+                } else {
+                    println!("    RC O1+2 roundtrip: FAILED");
                 }
             }
             Err(e) => println!("    Error reading {}: {}", path, e),
