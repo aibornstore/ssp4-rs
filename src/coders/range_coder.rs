@@ -474,6 +474,136 @@ pub fn range_decode_bytes_order2(data: &[u8]) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
+/// Adaptive order-0/1 mixing range coder.
+/// Blends order-0 and order-1 probability estimates using weighted integer arithmetic.
+/// O1 frequencies get WEIGHT multiplier for better text compression.
+const MIX_WEIGHT: u64 = 2; // O1 counts are weighted 2x
+
+pub fn range_encode_bytes_order_mix(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        let mut out = Vec::new();
+        out.push(3); // flag: mixed order
+        out.push(0); out.push(0); out.push(0); out.push(0); // length = 0
+        return out;
+    }
+    
+    let mut enc = RangeEncoder::new();
+    
+    // Order-0 model: uniform start with smoothing
+    let mut o0_freqs = [1u64; 256];
+    let mut o0_total: u64 = 256;
+    
+    // Order-1 model: [context][symbol] = frequency
+    let mut o1_freqs = [[1u64; 256]; 256];
+    let mut o1_totals = [256u64; 256];
+    
+    let mut prev = 0u8;
+    
+    for &b in data {
+        let sym = b as usize;
+        let ctx = prev as usize;
+        
+        // Integer-weighted mixing: o0_freq + o1_freq * WEIGHT
+        // This is deterministic and avoids floating-point errors
+        let mixed_cum: u64 = o0_freqs[..sym].iter().sum::<u64>() 
+            + o1_freqs[ctx][..sym].iter().sum::<u64>() * MIX_WEIGHT;
+        let mixed_count = o0_freqs[sym] + o1_freqs[ctx][sym] * MIX_WEIGHT;
+        let mixed_total = o0_total + o1_totals[ctx] * MIX_WEIGHT;
+        
+        // Encode with range coder
+        let total = mixed_total.max(1);
+        let cum = mixed_cum.min(total - 1);
+        let freq = mixed_count.max(1).min(total - cum);
+        
+        enc.encode(cum, freq, total);
+        
+        // Update both models
+        o0_freqs[sym] += 1;
+        o0_total += 1;
+        o1_freqs[ctx][sym] += 1;
+        o1_totals[ctx] += 1;
+        
+        prev = b;
+    }
+    
+    let mut out = Vec::new();
+    out.push(3); // flag: mixed order
+    
+    let len = data.len() as u32;
+    out.extend_from_slice(&len.to_le_bytes());
+    
+    out.extend(enc.flush());
+    out
+}
+
+/// Decode data encoded with adaptive order mixing.
+pub fn range_decode_bytes_order_mix(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if data.len() < 5 {
+        return Err("Range decode: data too short");
+    }
+    
+    let flag = data[0];
+    if flag != 3 {
+        return Err("Range decode: not mixed order encoded");
+    }
+    
+    let count = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+    let range_data = &data[5..];
+    
+    let mut dec = RangeDecoder::new(range_data);
+    let mut out = Vec::with_capacity(count);
+    
+    let mut o0_freqs = [1u64; 256];
+    let mut o0_total: u64 = 256;
+    let mut o1_freqs = [[1u64; 256]; 256];
+    let mut o1_totals = [256u64; 256];
+    
+    let mut prev = 0u8;
+    
+    for _ in 0..count {
+        let ctx = prev as usize;
+        
+        // Integer-weighted mixing: o0_freq + o1_freq * WEIGHT
+        let mixed_total = o0_total + o1_totals[ctx] * MIX_WEIGHT;
+        let f = dec.get_freq(mixed_total.max(1));
+        
+        // Find symbol matching cumulative frequency f
+        let mut sym = 0u8;
+        let mut cum = 0u64;
+        
+        for s in 0..256 {
+            let o0_cum = o0_freqs[..s].iter().sum::<u64>();
+            let o1_cum = o1_freqs[ctx][..s].iter().sum::<u64>();
+            let next_cum = o0_cum + o1_cum * MIX_WEIGHT + o0_freqs[s] + o1_freqs[ctx][s] * MIX_WEIGHT;
+            
+            if cum <= f && f < next_cum {
+                sym = s as u8;
+                break;
+            }
+            cum = next_cum;
+        }
+        
+        // Decode update
+        let o0_cum = o0_freqs[..sym as usize].iter().sum::<u64>();
+        let o1_cum = o1_freqs[ctx][..sym as usize].iter().sum::<u64>();
+        let dec_cum = o0_cum + o1_cum * MIX_WEIGHT;
+        let dec_freq = o0_freqs[sym as usize] + o1_freqs[ctx][sym as usize] * MIX_WEIGHT;
+        
+        dec.decode(dec_cum, dec_freq.max(1), mixed_total.max(1));
+        
+        out.push(sym);
+        
+        o0_freqs[sym as usize] += 1;
+        o0_total += 1;
+        o1_freqs[ctx][sym as usize] += 1;
+        o1_totals[ctx] += 1;
+        
+        prev = sym;
+    }
+    
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,5 +814,50 @@ mod tests {
         println!("Order-2 vs O1: {:.1}%", 100.0 * (1.0 - enc_order2.len() as f64 / enc_order1.len() as f64));
         
         // Order-2 may or may not be better depending on data
+    }
+    
+    // Order-mix (O0+O1) tests
+    
+    #[test]
+    fn test_order_mix_roundtrip_simple() {
+        let data = b"hello world";
+        let encoded = range_encode_bytes_order_mix(data);
+        let decoded = range_decode_bytes_order_mix(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_order_mix_roundtrip_repetitive() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        let encoded = range_encode_bytes_order_mix(&data);
+        let decoded = range_decode_bytes_order_mix(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_order_mix_vs_order1() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        
+        let enc_order1 = range_encode_bytes_order1(&data);
+        let enc_mix = range_encode_bytes_order_mix(&data);
+        
+        println!("Order-1: {} bytes", enc_order1.len());
+        println!("Order-mix: {} bytes", enc_mix.len());
+        println!("Mix vs O1: {:.1}%", 100.0 * (1.0 - enc_mix.len() as f64 / enc_order1.len() as f64));
+    }
+    
+    #[test]
+    fn test_order_mix_vs_order0() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        
+        let enc_order0 = range_encode_bytes(&data);
+        let enc_mix = range_encode_bytes_order_mix(&data);
+        
+        println!("Order-0: {} bytes", enc_order0.len());
+        println!("Order-mix: {} bytes", enc_mix.len());
+        println!("Mix vs O0: {:.1}%", 100.0 * (1.0 - enc_mix.len() as f64 / enc_order0.len() as f64));
     }
 }
