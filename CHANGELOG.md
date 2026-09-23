@@ -3,26 +3,24 @@
 ## Unreleased
 
 ### Added
-- **Range coder pipeline (order-0)** (`src/coders/range_coder.rs`):
-  - `range_encode_bytes()` and `range_decode_bytes()` functions
-  - Near-optimal compression for byte distributions
-- **Range coder pipeline (order-1 context model)**:
-  - `range_encode_bytes_order1()` and `range_decode_bytes_order1()` functions
-  - Uses 256 context tables (one per previous byte) for better compression
-- **BWT→MTF→RangeCoder pipeline** (`src/coders/ssp5_pipeline.rs`):
-  - `ssp5_encode_with_range_coder()` and `ssp5_decode_with_range_coder()` (order-0, v4)
-  - `ssp5_encode_with_range_coder_o1()` and `ssp5_decode_with_range_coder_o1()` (order-1, v5)
-- **Real data compression tests** (`src/coders/real_data_test.rs`): Compares SSP, RC O0, and RC O1 pipelines.
+- **Range coder pipelines** (`src/coders/range_coder.rs`, `src/coders/ssp5_pipeline.rs`):
+  - Order-0: `range_encode_bytes()` / `range_decode_bytes()` (v4)
+  - Order-1: `range_encode_bytes_order1()` / `range_decode_bytes_order1()` (v5)
+  - Order-2: `range_encode_bytes_order2()` / `range_decode_bytes_order2()` (v6)
+- **Real data compression tests** comparing all pipeline variants.
 
 ### Compression Results (alice29.txt 152KB)
-| Pipeline | Ratio | Improvement |
-|----------|-------|-------------|
+| Pipeline | Ratio | vs SSP |
+|----------|-------|--------|
 | SSP | 62.39% | baseline |
 | RC O0 | 32.22% | 30pp better |
-| RC O1 | 31.63% | 31pp better |
+| **RC O1** | **31.63%** | **31pp better** |
+| RC O2 | 37.26% | 25pp better |
+
+**Note:** Order-2 underperforms due to 65536 contexts being too sparse for MTF data. Order-1 is optimal.
 
 ### Fixed
-- **OOM in `test_encode_decode_roundtrip`**: Resolved stack buffer overrun (exit code 0xc0000409).
+- **OOM in `test_encode_decode_roundtrip`**: Resolved stack buffer overrun.
 
 ## Previous (v0.1.0)
 
