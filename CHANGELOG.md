@@ -3,20 +3,26 @@
 ## Unreleased
 
 ### Added
-- **Range coder pipeline** (`src/coders/range_coder.rs`): Adaptive order-0 range coder for byte streams
+- **Range coder pipeline (order-0)** (`src/coders/range_coder.rs`):
   - `range_encode_bytes()` and `range_decode_bytes()` functions
   - Near-optimal compression for byte distributions
+- **Range coder pipeline (order-1 context model)**:
+  - `range_encode_bytes_order1()` and `range_decode_bytes_order1()` functions
+  - Uses 256 context tables (one per previous byte) for better compression
 - **BWT→MTF→RangeCoder pipeline** (`src/coders/ssp5_pipeline.rs`):
-  - `ssp5_encode_with_range_coder()` and `ssp5_decode_with_range_coder()` functions
-  - Archive v4 format: [MAGIC(4)][VERSION=4(1)][PRIMARY(4)][MTF_LEN(4)][RC_DATA...]
-  - Compression improvement: alice29 62.39%→32.22% (30pp), repetitive 25.40%→5.32% (20pp)
-- **Real data compression tests** (`src/coders/real_data_test.rs`): New test module comparing SSP vs RangeCoder pipelines on real data files.
+  - `ssp5_encode_with_range_coder()` and `ssp5_decode_with_range_coder()` (order-0, v4)
+  - `ssp5_encode_with_range_coder_o1()` and `ssp5_decode_with_range_coder_o1()` (order-1, v5)
+- **Real data compression tests** (`src/coders/real_data_test.rs`): Compares SSP, RC O0, and RC O1 pipelines.
+
+### Compression Results (alice29.txt 152KB)
+| Pipeline | Ratio | Improvement |
+|----------|-------|-------------|
+| SSP | 62.39% | baseline |
+| RC O0 | 32.22% | 30pp better |
+| RC O1 | 31.63% | 31pp better |
 
 ### Fixed
 - **OOM in `test_encode_decode_roundtrip`**: Resolved stack buffer overrun (exit code 0xc0000409).
-
-### Changed
-- Updated `real_data_test.rs` to compare SSP and RangeCoder pipelines with roundtrip verification.
 
 ## Previous (v0.1.0)
 
