@@ -15,13 +15,15 @@ use super::mtf::{mtf_encode, mtf_decode};
 use super::ssp_codec::{encode as ssp_encode, decode as ssp_decode};
 use super::lz77::{encode as lz77_encode, decode as lz77_decode, Token};
 use super::range_coder::{range_encode_bytes, range_decode_bytes, 
-                          range_encode_bytes_order1, range_decode_bytes_order1};
+                          range_encode_bytes_order1, range_decode_bytes_order1,
+                          range_encode_bytes_order2, range_decode_bytes_order2};
 
 /// Wrapper magic: distinct from SSP5_MAGIC so ssp_decode finds SSP5_MAGIC at ssp_data offset
 const WRAPPER_MAGIC: &[u8; 4] = b"SS5W";
 const WRAPPER_VERSION: u8 = 3; // Version 3 supports chunked BWT
 const WRAPPER_VERSION_RC: u8 = 4; // Version 4 uses range coder (order-0)
 const WRAPPER_VERSION_RC_O1: u8 = 5; // Version 5 uses range coder (order-1 context)
+const WRAPPER_VERSION_RC_O2: u8 = 6; // Version 6 uses range coder (order-2 context)
 
 /// Encode data with SSP5 pipeline: BWT → MTF → SSP (no LZ77)
 /// chunk_size: 0 = no chunking, >0 = split into chunks of that size
@@ -310,6 +312,70 @@ pub fn ssp5_decode_with_range_coder_o1(archive: &[u8]) -> Result<Vec<u8>, &'stat
     
     // Order-1 Range coder decode
     let mtf_data = range_decode_bytes_order1(rc_data)?;
+    if mtf_data.len() != mtf_len {
+        return Err("MTF length mismatch");
+    }
+    
+    // MTF decode
+    let bwt_decoded = mtf_decode(&mtf_data);
+    
+    // Unpack and BWT decode
+    let (dec_primary, dec_bwt) = unpack_bwt(&bwt_decoded);
+    if dec_primary as u32 != primary as u32 {
+        return Err("BWT primary index mismatch");
+    }
+    
+    Ok(bwt_decode(dec_primary, &dec_bwt))
+}
+
+/// Encode data with BWT → MTF → RangeCoder Order-2 pipeline.
+/// Uses order-2 context modeling (previous 2 bytes) for potentially better compression.
+pub fn ssp5_encode_with_range_coder_o2(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    
+    // BWT → pack(primary + last_col)
+    let (primary, bwt_data) = bwt_encode(data);
+    let bwt_packed = pack_bwt(primary, &bwt_data);
+    
+    // MTF encoding
+    let mtf_data = mtf_encode(&bwt_packed);
+    
+    // Order-2 Range coder encoding
+    let rc_data = range_encode_bytes_order2(&mtf_data);
+    
+    // Archive format v6:
+    // [WRAPPER_MAGIC(4)][VERSION=6(1)][PRIMARY(4)][MTF_LEN(4)][RC_DATA...]
+    let mut out = Vec::with_capacity(13 + rc_data.len());
+    out.extend_from_slice(WRAPPER_MAGIC);
+    out.push(WRAPPER_VERSION_RC_O2);
+    out.extend_from_slice(&(primary as u32).to_le_bytes());
+    out.extend_from_slice(&(mtf_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&rc_data);
+    out
+}
+
+/// Decode data from BWT → MTF → RangeCoder Order-2 pipeline.
+pub fn ssp5_decode_with_range_coder_o2(archive: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if archive.is_empty() {
+        return Ok(Vec::new());
+    }
+    
+    // Check magic and version
+    if &archive[0..4] != WRAPPER_MAGIC {
+        return Err("Invalid wrapper magic");
+    }
+    if archive[4] != WRAPPER_VERSION_RC_O2 {
+        return Err("Invalid wrapper version for order-2 range coder");
+    }
+    
+    let primary = u32::from_le_bytes([archive[5], archive[6], archive[7], archive[8]]) as usize;
+    let mtf_len = u32::from_le_bytes([archive[9], archive[10], archive[11], archive[12]]) as usize;
+    let rc_data = &archive[13..];
+    
+    // Order-2 Range coder decode
+    let mtf_data = range_decode_bytes_order2(rc_data)?;
     if mtf_data.len() != mtf_len {
         return Err("MTF length mismatch");
     }

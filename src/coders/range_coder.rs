@@ -360,6 +360,120 @@ pub fn range_decode_bytes_order1(data: &[u8]) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
+/// Adaptive order-2 context model for byte data.
+/// Uses 256*256 = 65536 contexts (previous 2 bytes), each with 256 symbol frequencies.
+/// Context (0, 0) is used for first two bytes (no previous context).
+
+/// Adaptive order-2 range encoder for byte data.
+/// Uses context=previous_2_bytes for encoding, providing better compression than order-1.
+pub fn range_encode_bytes_order2(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        let mut out = Vec::new();
+        out.push(2); // flag: order-2
+        out.push(0); out.push(0); out.push(0); out.push(0); // length = 0 (4 bytes LE)
+        return out;
+    }
+    
+    let mut enc = RangeEncoder::new();
+    
+    // Order-2 context tables: [ctx][symbol] = frequency
+    // ctx = (prev1 as usize) * 256 + (prev2 as usize)
+    // Initialize with small non-zero values for smoothing
+    let mut ctx: Vec<[u64; SYM_SIZE]> = vec![[1u64; SYM_SIZE]; CTX_SIZE * CTX_SIZE];
+    let mut ctx_totals: Vec<u64> = vec![256u64; CTX_SIZE * CTX_SIZE];
+    
+    let mut prev1 = 0u8;
+    let mut prev2 = 0u8; // context for first byte is (0, 0)
+    
+    for &b in data {
+        let sym = b as usize;
+        let ctx_idx = (prev1 as usize) * CTX_SIZE + (prev2 as usize);
+        
+        // Get frequencies for this context
+        let total = ctx_totals[ctx_idx];
+        
+        // Encode symbol using context-specific frequencies
+        let mut cum = 0u64;
+        for i in 0..sym {
+            cum += ctx[ctx_idx][i];
+        }
+        let freq = ctx[ctx_idx][sym];
+        enc.encode(cum, freq, total);
+        
+        // Update context model
+        ctx[ctx_idx][sym] += 1;
+        ctx_totals[ctx_idx] += 1;
+        
+        prev2 = prev1;
+        prev1 = b; // current becomes previous for next iteration
+    }
+    
+    let mut out = Vec::new();
+    out.push(2); // flag: order-2
+    
+    // Write symbol count as 4-byte little-endian
+    let len = data.len() as u32;
+    out.extend_from_slice(&len.to_le_bytes());
+    
+    out.extend(enc.flush());
+    out
+}
+
+/// Adaptive order-2 range decoder for byte data.
+pub fn range_decode_bytes_order2(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if data.len() < 5 {
+        return Err("Range decode: data too short");
+    }
+    
+    let flag = data[0];
+    if flag != 2 {
+        return Err("Range decode: not order-2 encoded");
+    }
+    
+    let count = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+    let range_data = &data[5..];
+    
+    let mut dec = RangeDecoder::new(range_data);
+    let mut out = Vec::with_capacity(count);
+    
+    // Order-2 context tables
+    let mut ctx: Vec<[u64; SYM_SIZE]> = vec![[1u64; SYM_SIZE]; CTX_SIZE * CTX_SIZE];
+    let mut ctx_totals: Vec<u64> = vec![256u64; CTX_SIZE * CTX_SIZE];
+    
+    let mut prev1 = 0u8;
+    let mut prev2 = 0u8;
+    
+    for _ in 0..count {
+        let ctx_idx = (prev1 as usize) * CTX_SIZE + (prev2 as usize);
+        let total = ctx_totals[ctx_idx];
+        
+        let f = dec.get_freq(total);
+        
+        // Find symbol by cumulative frequency lookup
+        let mut cum = 0u64;
+        let mut sym = 0u8;
+        for i in 0..SYM_SIZE {
+            cum += ctx[ctx_idx][i];
+            if f < cum {
+                sym = i as u8;
+                break;
+            }
+        }
+        
+        // Decode and update context
+        let freq = ctx[ctx_idx][sym as usize];
+        dec.decode(cum - freq, freq, total);
+        ctx[ctx_idx][sym as usize] += 1;
+        ctx_totals[ctx_idx] += 1;
+        
+        out.push(sym);
+        prev2 = prev1;
+        prev1 = sym;
+    }
+    
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,5 +643,46 @@ mod tests {
         
         // Order-1 should be smaller
         assert!(enc_order1.len() < enc_order0.len(), "Order-1 should compress better");
+    }
+    
+    // Order-2 context model tests
+    
+    #[test]
+    fn test_order2_roundtrip_empty() {
+        let encoded = range_encode_bytes_order2(&[]);
+        let decoded = range_decode_bytes_order2(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, Vec::<u8>::new());
+    }
+    
+    #[test]
+    fn test_order2_roundtrip_simple() {
+        let data = b"hello world";
+        let encoded = range_encode_bytes_order2(data);
+        let decoded = range_decode_bytes_order2(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_order2_roundtrip_repetitive() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        let encoded = range_encode_bytes_order2(&data);
+        let decoded = range_decode_bytes_order2(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_order2_vs_order1() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        
+        let enc_order1 = range_encode_bytes_order1(&data);
+        let enc_order2 = range_encode_bytes_order2(&data);
+        
+        println!("Order-1: {} bytes", enc_order1.len());
+        println!("Order-2: {} bytes", enc_order2.len());
+        println!("Order-2 vs O1: {:.1}%", 100.0 * (1.0 - enc_order2.len() as f64 / enc_order1.len() as f64));
+        
+        // Order-2 may or may not be better depending on data
     }
 }
