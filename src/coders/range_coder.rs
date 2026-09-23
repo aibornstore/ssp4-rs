@@ -628,6 +628,215 @@ pub fn range_decode_bytes_order12_mix(data: &[u8]) -> Result<Vec<u8>, &'static s
     Ok(out)
 }
 
+/// Adaptive order-0/1/2 mixing with EWMA-based model weighting.
+/// Each model (O0, O1, O2) has a reliability score updated via EWMA.
+/// Models with lower prediction error get higher weight in blending.
+const EWMA_ALPHA: f64 = 0.1; // Smoothing factor for EWMA
+
+pub fn range_encode_bytes_order_ewma(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        let mut out = Vec::new();
+        out.push(6); // flag: O0+O1+O2 EWMA
+        out.push(0); out.push(0); out.push(0); out.push(0);
+        return out;
+    }
+    
+    let mut enc = RangeEncoder::new();
+    
+    // O0 model
+    let mut o0_freqs = [1u64; 256];
+    let mut o0_total: u64 = 256;
+    
+    // O1 model
+    let mut o1_freqs = [[1u64; 256]; 256];
+    let mut o1_totals = [256u64; 256];
+    
+    // O2 model
+    let mut o2_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; 256 * 256];
+    let mut o2_totals: Vec<u64> = vec![256u64; 256 * 256];
+    
+    // EWMA error tracking (lower = better model)
+    let mut o0_err: f64 = 0.5;
+    let mut o1_err: f64 = 0.5;
+    let mut o2_err: f64 = 0.5;
+    
+    let mut prev1 = 0u8;
+    let mut prev2 = 0u8;
+    
+    for &b in data {
+        let sym = b as usize;
+        let o1_ctx = prev1 as usize;
+        let o2_ctx = (prev1 as usize) * 256 + (prev2 as usize);
+        
+        // Compute inverse-error weights (higher = better model = more weight)
+        let inv_o0 = 1.0 / (o0_err + 0.001);
+        let inv_o1 = 1.0 / (o1_err + 0.001);
+        let inv_o2 = 1.0 / (o2_err + 0.001);
+        let inv_sum = inv_o0 + inv_o1 + inv_o2;
+        
+        // Convert to integer weights (scaled by 100 for precision)
+        let w0 = ((inv_o0 / inv_sum) * 100.0) as u64;
+        let w1 = ((inv_o1 / inv_sum) * 100.0) as u64;
+        let w2 = ((inv_o2 / inv_sum) * 100.0) as u64;
+        
+        // Compute cumulative frequencies with weighting
+        let o0_cum: u64 = o0_freqs[..sym].iter().sum();
+        let o1_cum: u64 = o1_freqs[o1_ctx][..sym].iter().sum();
+        let o2_cum: u64 = o2_freqs[o2_ctx][..sym].iter().sum();
+        
+        let mixed_cum = o0_cum * w0 + o1_cum * w1 + o2_cum * w2;
+        
+        let o0_count = o0_freqs[sym];
+        let o1_count = o1_freqs[o1_ctx][sym];
+        let o2_count = o2_freqs[o2_ctx][sym];
+        
+        let mixed_count = o0_count * w0 + o1_count * w1 + o2_count * w2;
+        let mixed_total = o0_total * w0 + o1_totals[o1_ctx] * w1 + o2_totals[o2_ctx] * w2;
+        
+        // Encode
+        let total = mixed_total.max(1);
+        let cum = mixed_cum.min(total - 1);
+        let freq = mixed_count.max(1).min(total - cum);
+        
+        enc.encode(cum, freq, total);
+        
+        // Compute actual probability and update EWMA errors
+        let actual_prob = freq as f64 / total as f64;
+        let symbol_prob = 1.0 / 256.0;
+        let o0_err_delta = (actual_prob - symbol_prob).abs();
+        let o1_err_delta = (actual_prob - o1_freqs[o1_ctx][sym] as f64 / (o1_totals[o1_ctx] as f64).max(1.0)).abs();
+        let o2_err_delta = (actual_prob - o2_freqs[o2_ctx][sym] as f64 / o2_totals[o2_ctx].max(1) as f64).abs();
+        
+        o0_err = (1.0 - EWMA_ALPHA) * o0_err + EWMA_ALPHA * o0_err_delta;
+        o1_err = (1.0 - EWMA_ALPHA) * o1_err + EWMA_ALPHA * o1_err_delta;
+        o2_err = (1.0 - EWMA_ALPHA) * o2_err + EWMA_ALPHA * o2_err_delta;
+        
+        // Update all models
+        o0_freqs[sym] += 1;
+        o0_total += 1;
+        o1_freqs[o1_ctx][sym] += 1;
+        o1_totals[o1_ctx] += 1;
+        o2_freqs[o2_ctx][sym] += 1;
+        o2_totals[o2_ctx] += 1;
+        
+        prev2 = prev1;
+        prev1 = b;
+    }
+    
+    let mut out = Vec::new();
+    out.push(6); // flag: O0+O1+O2 EWMA
+    
+    let len = data.len() as u32;
+    out.extend_from_slice(&len.to_le_bytes());
+    
+    out.extend(enc.flush());
+    out
+}
+
+/// Decode data encoded with O0+O1+O2 EWMA mixing.
+pub fn range_decode_bytes_order_ewma(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if data.len() < 5 {
+        return Err("Range decode: data too short");
+    }
+    
+    let flag = data[0];
+    if flag != 6 {
+        return Err("Range decode: not O0+O1+O2 EWMA encoded");
+    }
+    
+    let count = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+    let range_data = &data[5..];
+    
+    let mut dec = RangeDecoder::new(range_data);
+    let mut out = Vec::with_capacity(count);
+    
+    let mut o0_freqs = [1u64; 256];
+    let mut o0_total: u64 = 256;
+    let mut o1_freqs = [[1u64; 256]; 256];
+    let mut o1_totals = [256u64; 256];
+    let mut o2_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; 256 * 256];
+    let mut o2_totals: Vec<u64> = vec![256u64; 256 * 256];
+    
+    let mut o0_err: f64 = 0.5;
+    let mut o1_err: f64 = 0.5;
+    let mut o2_err: f64 = 0.5;
+    
+    let mut prev1 = 0u8;
+    let mut prev2 = 0u8;
+    
+    for _ in 0..count {
+        let o1_ctx = prev1 as usize;
+        let o2_ctx = (prev1 as usize) * 256 + (prev2 as usize);
+        
+        let inv_o0 = 1.0 / (o0_err + 0.001);
+        let inv_o1 = 1.0 / (o1_err + 0.001);
+        let inv_o2 = 1.0 / (o2_err + 0.001);
+        let inv_sum = inv_o0 + inv_o1 + inv_o2;
+        
+        let w0 = ((inv_o0 / inv_sum) * 100.0) as u64;
+        let w1 = ((inv_o1 / inv_sum) * 100.0) as u64;
+        let w2 = ((inv_o2 / inv_sum) * 100.0) as u64;
+        
+        let mixed_total = o0_total * w0 + o1_totals[o1_ctx] * w1 + o2_totals[o2_ctx] * w2;
+        let f = dec.get_freq(mixed_total.max(1));
+        
+        // Find symbol
+        let mut sym = 0u8;
+        let mut cum = 0u64;
+        
+        for s in 0..256 {
+            let o0_cum = o0_freqs[..s].iter().sum::<u64>();
+            let o1_cum = o1_freqs[o1_ctx][..s].iter().sum::<u64>();
+            let o2_cum = o2_freqs[o2_ctx][..s].iter().sum::<u64>();
+            
+            let next_cum = o0_cum * w0 + o1_cum * w1 + o2_cum * w2
+                + o0_freqs[s] * w0 + o1_freqs[o1_ctx][s] * w1 + o2_freqs[o2_ctx][s] * w2;
+            
+            if cum <= f && f < next_cum {
+                sym = s as u8;
+                break;
+            }
+            cum = next_cum;
+        }
+        
+        let o0_cum = o0_freqs[..sym as usize].iter().sum::<u64>();
+        let o1_cum = o1_freqs[o1_ctx][..sym as usize].iter().sum::<u64>();
+        let o2_cum = o2_freqs[o2_ctx][..sym as usize].iter().sum::<u64>();
+        
+        let dec_cum = o0_cum * w0 + o1_cum * w1 + o2_cum * w2;
+        let dec_freq = o0_freqs[sym as usize] * w0 + o1_freqs[o1_ctx][sym as usize] * w1 + o2_freqs[o2_ctx][sym as usize] * w2;
+        
+        dec.decode(dec_cum, dec_freq.max(1), mixed_total.max(1));
+        
+        out.push(sym);
+        
+        // Update errors
+        let total = mixed_total.max(1);
+        let actual_prob = dec_freq as f64 / total as f64;
+        let symbol_prob = 1.0 / 256.0;
+        let o0_err_delta = (actual_prob - symbol_prob).abs();
+        let o1_err_delta = (actual_prob - o1_freqs[o1_ctx][sym as usize] as f64 / (o1_totals[o1_ctx] as f64).max(1.0)).abs();
+        let o2_err_delta = (actual_prob - o2_freqs[o2_ctx][sym as usize] as f64 / o2_totals[o2_ctx].max(1) as f64).abs();
+        
+        o0_err = (1.0 - EWMA_ALPHA) * o0_err + EWMA_ALPHA * o0_err_delta;
+        o1_err = (1.0 - EWMA_ALPHA) * o1_err + EWMA_ALPHA * o1_err_delta;
+        o2_err = (1.0 - EWMA_ALPHA) * o2_err + EWMA_ALPHA * o2_err_delta;
+        
+        // Update models
+        o0_freqs[sym as usize] += 1;
+        o0_total += 1;
+        o1_freqs[o1_ctx][sym as usize] += 1;
+        o1_totals[o1_ctx] += 1;
+        o2_freqs[o2_ctx][sym as usize] += 1;
+        o2_totals[o2_ctx] += 1;
+        
+        prev2 = prev1;
+        prev1 = sym;
+    }
+    
+    Ok(out)
+}
+
 /// Adaptive order-0/1 mixing range coder.
 /// Blends order-0 and order-1 probability estimates using weighted integer arithmetic.
 /// O1 frequencies get WEIGHT multiplier for better text compression.
@@ -1057,5 +1266,37 @@ mod tests {
         
         println!("Order-0+1 mix: {} bytes", enc_o01.len());
         println!("Order-1+2 mix: {} bytes", enc_o12.len());
+    }
+    
+    // O0+O1+O2 EWMA tests
+    
+    #[test]
+    fn test_order_ewma_roundtrip_simple() {
+        let data = b"hello world";
+        let encoded = range_encode_bytes_order_ewma(data);
+        let decoded = range_decode_bytes_order_ewma(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_order_ewma_roundtrip_repetitive() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        let encoded = range_encode_bytes_order_ewma(&data);
+        let decoded = range_decode_bytes_order_ewma(&encoded).expect("range decode should succeed");
+        assert_eq!(decoded, data);
+    }
+    
+    #[test]
+    fn test_order_ewma_vs_order_mix() {
+        let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
+            .cycle().take(1000).copied().collect();
+        
+        let enc_mix = range_encode_bytes_order_mix(&data);
+        let enc_ewma = range_encode_bytes_order_ewma(&data);
+        
+        println!("Order-0+1 mix: {} bytes", enc_mix.len());
+        println!("Order-EWMA (O0+O1+O2): {} bytes", enc_ewma.len());
+        println!("EWMA vs mix: {:.1}%", 100.0 * (1.0 - enc_ewma.len() as f64 / enc_mix.len() as f64));
     }
 }

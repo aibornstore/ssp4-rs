@@ -18,7 +18,8 @@ use super::range_coder::{range_encode_bytes, range_decode_bytes,
                           range_encode_bytes_order1, range_decode_bytes_order1,
                           range_encode_bytes_order2, range_decode_bytes_order2,
                           range_encode_bytes_order_mix, range_decode_bytes_order_mix,
-                          range_encode_bytes_order12_mix, range_decode_bytes_order12_mix};
+                          range_encode_bytes_order12_mix, range_decode_bytes_order12_mix,
+                          range_encode_bytes_order_ewma, range_decode_bytes_order_ewma};
 
 /// Wrapper magic: distinct from SSP5_MAGIC so ssp_decode finds SSP5_MAGIC at ssp_data offset
 const WRAPPER_MAGIC: &[u8; 4] = b"SS5W";
@@ -28,6 +29,7 @@ const WRAPPER_VERSION_RC_O1: u8 = 5; // Version 5 uses range coder (order-1 cont
 const WRAPPER_VERSION_RC_O2: u8 = 6; // Version 6 uses range coder (order-2 context)
 const WRAPPER_VERSION_RC_MIX: u8 = 7; // Version 7 uses range coder (order-0+1 mixed)
 const WRAPPER_VERSION_RC_O12: u8 = 8; // Version 8 uses range coder (order-1+2 mixed)
+const WRAPPER_VERSION_RC_EWMA: u8 = 9; // Version 9 uses range coder (O0+O1+O2 EWMA)
 
 /// Encode data with SSP5 pipeline: BWT → MTF → SSP (no LZ77)
 /// chunk_size: 0 = no chunking, >0 = split into chunks of that size
@@ -500,6 +502,59 @@ pub fn ssp5_decode_with_range_coder_o12(archive: &[u8]) -> Result<Vec<u8>, &'sta
     let rc_data = &archive[13..];
     
     let mtf_data = range_decode_bytes_order12_mix(rc_data)?;
+    if mtf_data.len() != mtf_len {
+        return Err("MTF length mismatch");
+    }
+    
+    let bwt_decoded = mtf_decode(&mtf_data);
+    let (dec_primary, dec_bwt) = unpack_bwt(&bwt_decoded);
+    if dec_primary as u32 != primary as u32 {
+        return Err("BWT primary index mismatch");
+    }
+    
+    Ok(bwt_decode(dec_primary, &dec_bwt))
+}
+
+/// Encode data with BWT → MTF → RangeCoder O0+O1+O2 EWMA pipeline.
+/// Adaptively blends O0, O1, O2 with EWMA-based model weighting.
+pub fn ssp5_encode_with_range_coder_ewma(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    
+    let (primary, bwt_data) = bwt_encode(data);
+    let bwt_packed = pack_bwt(primary, &bwt_data);
+    let mtf_data = mtf_encode(&bwt_packed);
+    
+    let rc_data = range_encode_bytes_order_ewma(&mtf_data);
+    
+    let mut out = Vec::with_capacity(13 + rc_data.len());
+    out.extend_from_slice(WRAPPER_MAGIC);
+    out.push(WRAPPER_VERSION_RC_EWMA);
+    out.extend_from_slice(&(primary as u32).to_le_bytes());
+    out.extend_from_slice(&(mtf_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&rc_data);
+    out
+}
+
+/// Decode data from BWT → MTF → RangeCoder O0+O1+O2 EWMA pipeline.
+pub fn ssp5_decode_with_range_coder_ewma(archive: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if archive.is_empty() {
+        return Ok(Vec::new());
+    }
+    
+    if &archive[0..4] != WRAPPER_MAGIC {
+        return Err("Invalid wrapper magic");
+    }
+    if archive[4] != WRAPPER_VERSION_RC_EWMA {
+        return Err("Invalid wrapper version for EWMA range coder");
+    }
+    
+    let primary = u32::from_le_bytes([archive[5], archive[6], archive[7], archive[8]]) as usize;
+    let mtf_len = u32::from_le_bytes([archive[9], archive[10], archive[11], archive[12]]) as usize;
+    let rc_data = &archive[13..];
+    
+    let mtf_data = range_decode_bytes_order_ewma(rc_data)?;
     if mtf_data.len() != mtf_len {
         return Err("MTF length mismatch");
     }
