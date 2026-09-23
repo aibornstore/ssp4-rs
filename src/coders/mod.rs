@@ -8,6 +8,7 @@ pub mod bwt;
 pub mod mtf;
 pub mod ssp5_pipeline;
 pub mod lz77;
+pub mod real_data_test;
 
 // Re-exports for convenience
 pub use bit_io::{BitReader, BitWriter, uleb_decode, uleb_encode};
