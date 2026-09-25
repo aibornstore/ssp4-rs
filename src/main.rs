@@ -390,7 +390,7 @@ fn main() {
             } else if use_lz77 {
                 ssp4_rs::ssp5_encode_with_lz77(&data, &s, block_bits)
             } else if chunk_size > 0 || bwt_passes > 1 {
-                ssp4_rs::ssp5_encode_with_options(&data, &s, block_bits, chunk_size, bwt_passes)
+                ssp4_rs::ssp5_encode_with_options(&data, &s, block_bits, chunk_size, bwt_passes, false)
             } else {
                 ssp4_rs::ssp5_encode(&data, &s, block_bits)
             };

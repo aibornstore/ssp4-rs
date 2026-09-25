@@ -11,7 +11,7 @@
 
 use super::bwt::{bwt_encode, bwt_decode, pack_bwt, unpack_bwt, 
                  bwt_encode_chunked, bwt_decode_chunked, bwt_encode_iterative};
-use super::mtf::{mtf_encode, mtf_decode};
+use super::mtf::{mtf_encode, mtf_decode, mtf_encode_bwt_chunked, mtf_decode_bwt_chunked};
 use super::ssp_codec::{encode as ssp_encode, decode as ssp_decode};
 use super::lz77::{encode as lz77_encode, decode as lz77_decode, Token};
 use super::range_coder::{range_encode_bytes, range_decode_bytes, 
@@ -22,7 +22,9 @@ use super::range_coder::{range_encode_bytes, range_decode_bytes,
                           range_encode_bytes_order_ewma, range_decode_bytes_order_ewma,
                           range_encode_bytes_order_ewma3, range_decode_bytes_order_ewma3,
                           range_encode_bytes_order_ewma5, range_decode_bytes_order_ewma5,
-                          range_encode_bytes_order_ewma7, range_decode_bytes_order_ewma7};
+                          range_encode_bytes_order_ewma7, range_decode_bytes_order_ewma7,
+                          range_encode_bytes_order_ewma7_alpha_ws, range_decode_bytes_order_ewma7_alpha_ws};
+use super::fse::{huffman_encode, huffman_decode};
 
 /// Wrapper magic: distinct from SSP5_MAGIC so ssp_decode finds SSP5_MAGIC at ssp_data offset
 const WRAPPER_MAGIC: &[u8; 4] = b"SS5W";
@@ -33,16 +35,22 @@ const WRAPPER_VERSION_RC_O2: u8 = 6; // Version 6 uses range coder (order-2 cont
 const WRAPPER_VERSION_RC_MIX: u8 = 7; // Version 7 uses range coder (order-0+1 mixed)
 const WRAPPER_VERSION_RC_O12: u8 = 8; // Version 8 uses range coder (order-1+2 mixed)
 const WRAPPER_VERSION_RC_EWMA: u8 = 9; // Version 9 uses range coder (O0+O1+O2 EWMA)
+const WRAPPER_VERSION_HUFFMAN: u8 = 17; // Version 17 uses Huffman coder on BWT+MTF output
+const WRAPPER_VERSION_RC_EWMA7: u8 = 18; // Version 18 uses range coder (O0-O7 EWMA)
+const WRAPPER_VERSION_RC_EWMA7_CHUNKED: u8 = 20; // Version 20: chunked BWT + per-chunk EWMA7
+const WRAPPER_VERSION_RC_EWMA7_ALPHA: u8 = 21; // Version 21: EWMA7 with explicit alpha in header
+const DEFAULT_CHUNK_SIZE_EWMA7: usize = 64 * 1024; // 64 KB - optimal for kennedy.xls
 
 /// Encode data with SSP5 pipeline: BWT → MTF → SSP (no LZ77)
 /// chunk_size: 0 = no chunking, >0 = split into chunks of that size
 /// bwt_passes: number of iterative BWT passes (1 = standard)
 pub fn ssp5_encode(data: &[u8], s: &[u64], block_bits: usize) -> Vec<u8> {
-    ssp5_encode_with_options(data, s, block_bits, 0, 1)
+    ssp5_encode_with_options(data, s, block_bits, 0, 1, false)
 }
 
 /// Encode with options for chunking and iterative BWT
-pub fn ssp5_encode_with_options(data: &[u8], s: &[u64], block_bits: usize, chunk_size: usize, bwt_passes: usize) -> Vec<u8> {
+/// delta: if true, use O1 subtraction-delta mode (context between blocks)
+pub fn ssp5_encode_with_options(data: &[u8], s: &[u64], block_bits: usize, chunk_size: usize, bwt_passes: usize, delta: bool) -> Vec<u8> {
     // BWT → pack(primary + last_col) → MTF → SSP
     let bwt_packed = if chunk_size > 0 && data.len() > chunk_size {
         // Chunked BWT
@@ -57,8 +65,16 @@ pub fn ssp5_encode_with_options(data: &[u8], s: &[u64], block_bits: usize, chunk
         pack_bwt(primary, &bwt_data)
     };
     
-    let mtf_data = mtf_encode(&bwt_packed);
-    let ssp_encoded = ssp_encode(&mtf_data, s, block_bits, false);
+    // Use adaptive MTF when chunking: fresh MTF alphabet per BWT chunk
+    let mtf_data = if chunk_size > 0 && bwt_packed.len() > chunk_size {
+        // Use adaptive MTF with fresh alphabet per chunk for better compression
+        // Format: [chunk_len(4)][mtf_chunk...] per BWT chunk
+        mtf_encode_bwt_chunked(&bwt_packed, chunk_size)
+    } else {
+        // Standard MTF for non-chunked data
+        mtf_encode(&bwt_packed)
+    };
+    let ssp_encoded = ssp_encode(&mtf_data, s, block_bits, delta);
     
     // Archive: [WRAPPER_MAGIC][VERSION][LZ77_FLAG=0][CHUNK_SIZE(4)][S_LEN][S...][SSP_DATA]
     let mut out = Vec::with_capacity(9 + s.len() * 8 + ssp_encoded.len());
@@ -135,21 +151,29 @@ pub fn ssp5_decode(archive: &[u8]) -> Vec<u8> {
         
         let ssp_data = &archive[s_end..];
         let mtf_data = ssp_decode(ssp_data, &s_vec).expect("SSP decode failed");
-        let bwt_decoded = mtf_decode(&mtf_data);
-        
+
         // Check if chunked based on chunk_size in header
         let chunk_size = if version >= 3 {
             u32::from_le_bytes([archive[6], archive[7], archive[8], archive[9]]) as usize
         } else {
             0
         };
-        
-        if chunk_size > 0 && bwt_decoded.len() > chunk_size {
-            // Actually chunked
-            bwt_decode_chunked(&bwt_decoded)
+
+        // Decode MTF data (with fresh alphabet per BWT chunk if chunked)
+        // Only use chunked MTF decode when the data is large enough to have been chunked
+        let bwt_packed = if chunk_size > 0 && mtf_data.len() > chunk_size {
+            mtf_decode_bwt_chunked(&mtf_data)
         } else {
-            // Non-chunked
-            let (dec_primary, dec_bwt) = unpack_bwt(&bwt_decoded);
+            mtf_decode(&mtf_data)
+        };
+
+        // Unpack BWT (primary + last column) and decode
+        if chunk_size > 0 && bwt_packed.len() > chunk_size {
+            // Chunked BWT decoding
+            bwt_decode_chunked(&bwt_packed)
+        } else {
+            // Non-chunked BWT decoding
+            let (dec_primary, dec_bwt) = unpack_bwt(&bwt_packed);
             bwt_decode(dec_primary, dec_bwt)
         }
     } else {
@@ -520,7 +544,6 @@ pub fn ssp5_decode_with_range_coder_o12(archive: &[u8]) -> Result<Vec<u8>, &'sta
 
 const WRAPPER_VERSION_RC_EWMA3: u8 = 10; // Version 10 uses range coder (O0+O1+O2+O3 EWMA)
 const WRAPPER_VERSION_RC_EWMA5: u8 = 11; // Version 11 uses range coder (O0+O1+O2+O3+O4+O5 EWMA)
-const WRAPPER_VERSION_RC_EWMA7: u8 = 12; // Version 12 uses range coder (O0+O1+O2+O3+O4+O5+O6+O7 EWMA)
 
 /// Encode data with BWT → MTF → RangeCoder O0+O1+O2 EWMA pipeline.
 /// Adaptively blends O0, O1, O2 with EWMA-based model weighting.
@@ -739,7 +762,7 @@ pub fn ssp5_decode_with_range_coder_ewma5_rle(archive: &[u8]) -> Result<Vec<u8>,
     let mtf_len = u32::from_le_bytes([archive[9], archive[10], archive[11], archive[12]]) as usize;
     let rc_data = &archive[13..];
     
-    let rle_data = range_decode_bytes_order_ewma5(rc_data)?;
+    let rle_data = range_decode_bytes_order_ewma5(rc_data, None)?;
     let mtf_data = reverse_rle(&rle_data, mtf_len as u32);
     
     let bwt_decoded = mtf_decode(&mtf_data);
@@ -769,7 +792,8 @@ pub fn ssp5_encode_with_range_coder_ewma7(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decode data from BWT → MTF → RangeCoder O0+O1+O2+O3+O4+O5+O6+O7 EWMA pipeline.
+/// Decode data from BWT → MTF →RangeCoder O0+O1+O2+O3+O4+O5+O6+O7 EWMA pipeline.
+/// Accepts version 18 (implicit EWMA_ALPHA) and version 21 (explicit alpha in header).
 pub fn ssp5_decode_with_range_coder_ewma7(archive: &[u8]) -> Result<Vec<u8>, &'static str> {
     if archive.is_empty() {
         return Ok(Vec::new());
@@ -777,19 +801,270 @@ pub fn ssp5_decode_with_range_coder_ewma7(archive: &[u8]) -> Result<Vec<u8>, &'s
     if &archive[0..4] != WRAPPER_MAGIC {
         return Err("Invalid wrapper magic");
     }
-    if archive[4] != WRAPPER_VERSION_RC_EWMA7 {
+    if archive[4] != WRAPPER_VERSION_RC_EWMA7 && archive[4] != WRAPPER_VERSION_RC_EWMA7_ALPHA {
         return Err("Invalid wrapper version for EWMA7 range coder");
     }
-    
-    let primary = u32::from_le_bytes([archive[5], archive[6], archive[7], archive[8]]) as usize;
-    let mtf_len = u32::from_le_bytes([archive[9], archive[10], archive[11], archive[12]]) as usize;
-    let rc_data = &archive[13..];
-    
-    let mtf_data = range_decode_bytes_order_ewma7(rc_data)?;
+
+    // Version 21: [MAGIC(4)][21][alpha f64 (8)][wscale f64 (8)][primary(4)][mtf_len(4)][rc]
+    let (alpha, wscale, data_start) = if archive[4] == WRAPPER_VERSION_RC_EWMA7_ALPHA {
+        if archive.len() < 29 {
+            return Err("Archive too short for alpha header");
+        }
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&archive[5..13]);
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&archive[13..21]);
+        (f64::from_le_bytes(a), f64::from_le_bytes(w), 21)
+    } else {
+        // Version 18: [MAGIC(4)][18][primary(4)][mtf_len(4)][rc]
+        (EWMA_ALPHA_DEFAULT, 100.0, 5)
+    };
+
+    if archive.len() < data_start + 8 {
+        return Err("Archive too short");
+    }
+    let primary = u32::from_le_bytes([archive[data_start], archive[data_start+1], archive[data_start+2], archive[data_start+3]]) as usize;
+    let mtf_len = u32::from_le_bytes([archive[data_start+4], archive[data_start+5], archive[data_start+6], archive[data_start+7]]) as usize;
+    let rc_data = &archive[data_start+8..];
+
+    let mtf_data = range_decode_bytes_order_ewma7_alpha_ws(rc_data, alpha, wscale)?;
     if mtf_data.len() != mtf_len {
         return Err("MTF length mismatch");
     }
-    
+
+    let bwt_decoded = mtf_decode(&mtf_data);
+    let (dec_primary, dec_bwt) = unpack_bwt(&bwt_decoded);
+    if dec_primary as u32 != primary as u32 {
+        return Err("BWT primary index mismatch");
+    }
+    Ok(bwt_decode(dec_primary, &dec_bwt))
+}
+
+/// Default EWMA alpha used by version-18 archives (must match range_coder::EWMA_ALPHA).
+const EWMA_ALPHA_DEFAULT: f64 = 0.05;
+
+/// Encode with explicit EWMA decay factor (weight scale = 100). Archive stores params (version 21).
+pub fn ssp5_encode_with_range_coder_ewma7_alpha(data: &[u8], alpha: f64) -> Vec<u8> {
+    ssp5_encode_with_range_coder_ewma7_alpha_ws(data, alpha, 100.0)
+}
+
+/// Encode with explicit alpha and mixing-weight scale. Archive stores both (version 21).
+pub fn ssp5_encode_with_range_coder_ewma7_alpha_ws(data: &[u8], alpha: f64, wscale: f64) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    let (primary, bwt_data) = bwt_encode(data);
+    let bwt_packed = pack_bwt(primary, &bwt_data);
+    let mtf_data = mtf_encode(&bwt_packed);
+    let rc_data = range_encode_bytes_order_ewma7_alpha_ws(&mtf_data, alpha, wscale);
+
+    let mut out = Vec::with_capacity(29 + rc_data.len());
+    out.extend_from_slice(WRAPPER_MAGIC);
+    out.push(WRAPPER_VERSION_RC_EWMA7_ALPHA);
+    out.extend_from_slice(&alpha.to_le_bytes());
+    out.extend_from_slice(&wscale.to_le_bytes());
+    out.extend_from_slice(&(primary as u32).to_le_bytes());
+    out.extend_from_slice(&(mtf_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&rc_data);
+    out
+}
+
+/// Auto-tune: try (alpha, wscale) candidates and keep the smallest archive.
+/// Base candidate is the plain version-18 archive (13-byte header) — it wins whenever
+/// the default config (0.05, 100) is optimal, avoiding the 16-byte v21 param overhead.
+/// (0.05, 6.0) wins on binary/spreadsheet (kennedy.xls 9.84%); (0.1, 100.0) on text (alice29 30.78%);
+/// chunking tested and LOSSES to non-chunked with tuned weights.
+pub fn ssp5_encode_with_range_coder_ewma7_auto(data: &[u8]) -> Vec<u8> {
+    let mut best = ssp5_encode_with_range_coder_ewma7(data); // (0.05, 100.0) in v18 format
+    let candidates = [(0.05f64, 6.0f64), (0.001, 7.0), (0.1, 100.0)];
+    for &(alpha, wscale) in &candidates {
+        let enc = ssp5_encode_with_range_coder_ewma7_alpha_ws(data, alpha, wscale);
+        if enc.len() < best.len() {
+            best = enc;
+        }
+    }
+    best
+}
+
+/// Encode data with BWT → MTF → RangeCoder O0-O7 EWMA pipeline, with chunked BWT
+/// and per-chunk EWMA state reset.
+/// chunk_size: 0 = no chunking (behaves identically to ssp5_encode_with_range_coder_ewma7),
+/// >0 = split data into chunks of that size, each encoded independently with fresh EWMA state.
+pub fn ssp5_encode_with_range_coder_ewma7_chunked(data: &[u8], chunk_size: usize) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+
+    if chunk_size == 0 || data.len() <= chunk_size {
+        // No chunking needed — delegate to non-chunked version
+        return ssp5_encode_with_range_coder_ewma7(data);
+    }
+
+    let num_chunks = (data.len() + chunk_size - 1) / chunk_size;
+
+    // Encode each chunk independently: BWT → MTF → range_encode_bytes_order_ewma7
+    // Each chunk gets fresh EWMA state
+    let mut chunk_metas: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(num_chunks); // (primary, mtf_len, rc_data_len, rc_data_offset)
+    let mut rc_concat = Vec::new();
+
+    for i in 0..num_chunks {
+        let start = i * chunk_size;
+        let end = (start + chunk_size).min(data.len());
+        let chunk = &data[start..end];
+
+        let (primary, bwt_data) = bwt_encode(chunk);
+        let bwt_packed = pack_bwt(primary, &bwt_data);
+        let mtf_data = mtf_encode(&bwt_packed);
+        let rc_data = range_encode_bytes_order_ewma7(&mtf_data);
+
+        let rc_offset = rc_concat.len() as u32;
+        chunk_metas.push((primary as u32, mtf_data.len() as u32, rc_data.len() as u32, rc_offset));
+        rc_concat.extend_from_slice(&rc_data);
+    }
+
+    // Archive format:
+    // [MAGIC(4)][VERSION(1)=20][NUM_CHUNKS(4)][CHUNK_SIZE(4)][MTF_LEN_TOTAL(4)]
+    // [CHUNK1_PRIMARY(4)][CHUNK1_MTF_LEN(4)][CHUNK1_RC_LEN(4)][CHUNK1_RC_OFFSET(4)]
+    // [CHUNK2_PRIMARY(4)][CHUNK2_MTF_LEN(4)][CHUNK2_RC_LEN(4)][CHUNK2_RC_OFFSET(4)]
+    // ...
+    // [RC_DATA_CONCAT]
+    let total_mtf_len: u64 = chunk_metas.iter().map(|m| m.1 as u64).sum();
+    let mut out = Vec::with_capacity(
+        9 + 4 + 4 + 4 + num_chunks * 16 + rc_concat.len()
+    );
+    out.extend_from_slice(WRAPPER_MAGIC);
+    out.push(WRAPPER_VERSION_RC_EWMA7_CHUNKED);
+    out.extend_from_slice(&(num_chunks as u32).to_le_bytes());
+    out.extend_from_slice(&(chunk_size as u32).to_le_bytes());
+    out.extend_from_slice(&(total_mtf_len as u32).to_le_bytes());
+
+    for &(primary, mtf_len, rc_len, rc_offset) in &chunk_metas {
+        out.extend_from_slice(&primary.to_le_bytes());
+        out.extend_from_slice(&mtf_len.to_le_bytes());
+        out.extend_from_slice(&rc_len.to_le_bytes());
+        out.extend_from_slice(&rc_offset.to_le_bytes());
+    }
+
+    out.extend_from_slice(&rc_concat);
+    out
+}
+
+/// Encode with optimal chunk size (64 KB) for BWT → MTF → RangeCoder O0-O7 EWMA pipeline.
+/// Each chunk gets fresh EWMA state; 64 KB blocks provide best adaptation.
+pub fn ssp5_encode_with_range_coder_ewma7_chunked_optimal(data: &[u8]) -> Vec<u8> {
+    ssp5_encode_with_range_coder_ewma7_chunked(data, DEFAULT_CHUNK_SIZE_EWMA7)
+}
+
+/// Decode data from BWT → MTF → RangeCoder O0-O7 EWMA pipeline with chunked BWT
+/// and per-chunk EWMA state reset.
+pub fn ssp5_decode_with_range_coder_ewma7_chunked(archive: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if archive.is_empty() {
+        return Ok(Vec::new());
+    }
+    if &archive[0..4] != WRAPPER_MAGIC {
+        return Err("Invalid wrapper magic");
+    }
+    // Accept both chunked (20) and non-chunked (18) EWMA7 versions
+    if archive[4] != WRAPPER_VERSION_RC_EWMA7_CHUNKED && archive[4] != WRAPPER_VERSION_RC_EWMA7 {
+        return Err("Invalid wrapper version for chunked EWMA7 range coder");
+    }
+
+    // If non-chunked version, delegate to non-chunked decoder
+    if archive[4] == WRAPPER_VERSION_RC_EWMA7 {
+        return ssp5_decode_with_range_coder_ewma7(archive);
+    }
+
+    let pos = 5;
+    let num_chunks = u32::from_le_bytes([archive[pos], archive[pos+1], archive[pos+2], archive[pos+3]]) as usize;
+    let _chunk_size = u32::from_le_bytes([archive[pos+4], archive[pos+5], archive[pos+6], archive[pos+7]]) as usize;
+
+    // Skip total_mtf_len (not needed for decoding since each chunk self-describes)
+    let mut offset = pos + 12; // skip num_chunks + chunk_size + total_mtf_len
+
+    // Read chunk metas: primary + mtf_len + rc_len + rc_offset for each chunk
+    let mut chunk_metas: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(num_chunks);
+    for _ in 0..num_chunks {
+        if offset + 16 > archive.len() {
+            return Err("Truncated chunk header");
+        }
+        let primary = u32::from_le_bytes([archive[offset], archive[offset+1], archive[offset+2], archive[offset+3]]);
+        let mtf_len = u32::from_le_bytes([archive[offset+4], archive[offset+5], archive[offset+6], archive[offset+7]]);
+        let rc_len = u32::from_le_bytes([archive[offset+8], archive[offset+9], archive[offset+10], archive[offset+11]]);
+        let rc_off = u32::from_le_bytes([archive[offset+12], archive[offset+13], archive[offset+14], archive[offset+15]]);
+        chunk_metas.push((primary, mtf_len, rc_len, rc_off));
+        offset += 16;
+    }
+
+    let mut out = Vec::new();
+
+    for (_, &(primary, mtf_len, rc_len, rc_off)) in chunk_metas.iter().enumerate() {
+        // Each chunk's RC data is self-contained
+        let rc_start = offset + rc_off as usize;
+        let rc_end = rc_start + rc_len as usize;
+        if rc_end > archive.len() {
+            return Err("Truncated RC data for chunk");
+        }
+        let rc_data = &archive[rc_start..rc_end];
+
+        // Decode this chunk's range coder output
+        let mtf_data = range_decode_bytes_order_ewma7(rc_data)?;
+        if mtf_data.len() != mtf_len as usize {
+            return Err("MTF length mismatch for chunk");
+        }
+
+        let bwt_decoded = mtf_decode(&mtf_data);
+        let (dec_primary, dec_bwt) = unpack_bwt(&bwt_decoded);
+        if dec_primary as u32 != primary {
+            return Err("BWT primary index mismatch for chunk");
+        }
+
+        out.extend_from_slice(&bwt_decode(dec_primary, &dec_bwt));
+    }
+
+    Ok(out)
+}
+
+/// Encode data with BWT → MTF → Huffman pipeline.
+pub fn ssp5_encode_with_huffman(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    let (primary, bwt_data) = bwt_encode(data);
+    let bwt_packed = pack_bwt(primary, &bwt_data);
+    let mtf_data = mtf_encode(&bwt_packed);
+
+    let hf_data = huffman_encode(&mtf_data);
+
+    let mut out = Vec::with_capacity(17 + hf_data.len());
+    out.extend_from_slice(WRAPPER_MAGIC);
+    out.push(WRAPPER_VERSION_HUFFMAN);
+    out.extend_from_slice(&(primary as u32).to_le_bytes());
+    out.extend_from_slice(&(mtf_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&hf_data);
+    out
+}
+
+/// Decode data from BWT → MTF → Huffman pipeline.
+pub fn ssp5_decode_with_huffman(archive: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if archive.is_empty() {
+        return Ok(Vec::new());
+    }
+    if &archive[0..4] != WRAPPER_MAGIC {
+        return Err("Invalid wrapper magic");
+    }
+    if archive[4] != WRAPPER_VERSION_HUFFMAN {
+        return Err("Invalid wrapper version for Huffman pipeline");
+    }
+
+    let primary = u32::from_le_bytes([archive[5], archive[6], archive[7], archive[8]]) as usize;
+    let mtf_len = u32::from_le_bytes([archive[9], archive[10], archive[11], archive[12]]) as usize;
+    let hf_data = &archive[13..];
+
+    let mtf_data = huffman_decode(hf_data)?;
+    if mtf_data.len() != mtf_len {
+        return Err("MTF length mismatch");
+    }
+
     let bwt_decoded = mtf_decode(&mtf_data);
     let (dec_primary, dec_bwt) = unpack_bwt(&bwt_decoded);
     if dec_primary as u32 != primary as u32 {
@@ -836,7 +1111,7 @@ pub fn ssp5_decode_with_range_coder_ewma5(archive: &[u8]) -> Result<Vec<u8>, &'s
     let mtf_len = u32::from_le_bytes([archive[9], archive[10], archive[11], archive[12]]) as usize;
     let rc_data = &archive[13..];
     
-    let mtf_data = range_decode_bytes_order_ewma5(rc_data)?;
+    let mtf_data = range_decode_bytes_order_ewma5(rc_data, Some(mtf_len))?;
     if mtf_data.len() != mtf_len {
         return Err("MTF length mismatch");
     }

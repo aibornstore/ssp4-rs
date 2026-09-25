@@ -87,7 +87,7 @@ fn generate_hybrids() -> Vec<(String, Vec<u64>)> {
 
 fn evaluate_s(data: &[u8], s: &[u64], block_bits: usize) -> Option<usize> {
     let enc = ssp5_encode(data, s, block_bits);
-    let dec = ssp5_decode(&enc).ok()?;
+    let dec = ssp5_decode(&enc);
     if dec != data {
         return None;
     }

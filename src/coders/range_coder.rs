@@ -631,7 +631,7 @@ pub fn range_decode_bytes_order12_mix(data: &[u8]) -> Result<Vec<u8>, &'static s
 /// Adaptive order-0/1/2/3/4/5/6/7 mixing with EWMA-based model weighting.
 /// Each model has a reliability score updated via EWMA.
 /// O3-O7 use fixed sparse tables (65K entries) for deterministic encoder/decoder sync.
-const EWMA_ALPHA: f64 = 0.1; // Smoothing factor for EWMA
+const EWMA_ALPHA: f64 = 0.05; // Slower adaptation for more stable predictions
 const O3_TABLE_SIZE: usize = 1 << 16; // 65536 fixed slots — no HashMap divergence
 const O3_MIN_SAMPLES: u64 = 10; // Minimum samples before O3 contributes
 const O4_MIN_SAMPLES: u64 = 15; // Minimum samples before O4 contributes
@@ -670,6 +670,8 @@ fn o6_hash(p1: u8, p2: u8, p3: u8, p4: u8, p5: u8, p6: u8) -> usize {
     let mut h = x.wrapping_mul(0x45d9f3b);
     h ^= h >> 16;
     h = h.wrapping_mul(0x45d9f3b);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x45d9f3b);
     (h as usize) & (O3_TABLE_SIZE - 1)
 }
 
@@ -678,6 +680,8 @@ fn o7_hash(p1: u8, p2: u8, p3: u8, p4: u8, p5: u8, p6: u8, p7: u8) -> usize {
         ^ ((p5 as u32).wrapping_mul(0x45d9f3b)) ^ ((p6 as u32).wrapping_mul(0x1b4e915d))
         ^ ((p7 as u32).wrapping_mul(0x9e3779b9));
     let mut h = x.wrapping_mul(0x45d9f3b);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x45d9f3b);
     h ^= h >> 16;
     h = h.wrapping_mul(0x45d9f3b);
     (h as usize) & (O3_TABLE_SIZE - 1)
@@ -1100,7 +1104,8 @@ pub fn range_encode_bytes_order_ewma5(data: &[u8]) -> Vec<u8> {
 }
 
 /// Decode data encoded with O0+O1+O2+O3+O4+O5 EWMA mixing (sparse tables).
-pub fn range_decode_bytes_order_ewma5(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+/// If `count_override` is Some, uses that count instead of reading from header.
+pub fn range_decode_bytes_order_ewma5(data: &[u8], count_override: Option<usize>) -> Result<Vec<u8>, &'static str> {
     if data.len() < 5 {
         return Err("Range decode: data too short");
     }
@@ -1110,10 +1115,23 @@ pub fn range_decode_bytes_order_ewma5(data: &[u8]) -> Result<Vec<u8>, &'static s
         return Err("Range decode: not O0+O1+O2+O3+O4+O5 EWMA encoded");
     }
     
-    let count = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+    let count = count_override.unwrap_or_else(|| {
+        u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize
+    });
     let range_data = &data[5..];
     
-    let mut dec = RangeDecoder::new(range_data);
+    eprintln!("RANGE_DEC: data.len()={}, flag={}, count={}, range_data.len()={}, range_data[:5]={:?}", 
+        data.len(), flag, count, range_data.len(), &range_data[..5.min(range_data.len())]);
+    
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    
+    eprintln!("RANGE_DEC FIRST SYM: about to decode first byte");
+    let mut dec = RangeDecoder::new(range_data);  // Read code from start of range_data (first 32 bits of flushed)
+    eprintln!("RANGE_DEC: dec.lo={}, dec.hi={}, dec.code={}", dec.lo, dec.hi, dec.code);
+    eprintln!("RANGE_DEC: data ptr={:p}, range_data ptr={:p}, range_data[:5]={:02x?}", data as *const _, range_data as *const _, &range_data[..5]);
+    
     let mut out = Vec::with_capacity(count);
     
     let mut o0_freqs = [1u64; 256];
@@ -1266,11 +1284,28 @@ pub fn range_decode_bytes_order_ewma5(data: &[u8]) -> Result<Vec<u8>, &'static s
         prev1 = sym;
     }
     
+    eprintln!("RANGE_DEC DONE: out.len={}, out[:10]={:02x?}", out.len(), &out[..10]);
     Ok(out)
+}
+
+/// Decode data encoded with O0+O1+O2+O3+O4+O5 EWMA mixing (sparse tables).
+/// Takes `count` as an explicit parameter (for ZRLE pipeline where count is stored in wrapper header).
+pub fn range_decode_bytes_order_ewma5_with_count(data: &[u8], count: usize) -> Result<Vec<u8>, &'static str> {
+    range_decode_bytes_order_ewma5(data, Some(count))
 }
 
 /// Encode data with adaptive O0+O1+O2+O3+O4+O5+O6+O7 EWMA mixing (sparse tables).
 pub fn range_encode_bytes_order_ewma7(data: &[u8]) -> Vec<u8> {
+    range_encode_bytes_order_ewma7_alpha(data, EWMA_ALPHA)
+}
+
+/// Encode with custom EWMA decay factor (alpha) for parameter sweeps.
+pub fn range_encode_bytes_order_ewma7_alpha(data: &[u8], alpha: f64) -> Vec<u8> {
+    range_encode_bytes_order_ewma7_alpha_ws(data, alpha, 100.0)
+}
+
+/// Encode with custom alpha and mixing-weight scale (granularity of w quantization).
+pub fn range_encode_bytes_order_ewma7_alpha_ws(data: &[u8], alpha: f64, wscale: f64) -> Vec<u8> {
     if data.is_empty() {
         let mut out = Vec::new();
         out.push(9); // flag: O0+O1+O2+O3+O4+O5+O6+O7 EWMA
@@ -1356,14 +1391,17 @@ pub fn range_encode_bytes_order_ewma7(data: &[u8]) -> Vec<u8> {
         let inv_o7 = if o7_reliable { 1.0 / (o7_err + 0.001) } else { 0.001 };
         let inv_sum = inv_o0 + inv_o1 + inv_o2 + inv_o3 + inv_o4 + inv_o5 + inv_o6 + inv_o7;
         
-        let w0 = ((inv_o0 / inv_sum) * 100.0) as u64;
-        let w1 = ((inv_o1 / inv_sum) * 100.0) as u64;
-        let w2 = ((inv_o2 / inv_sum) * 100.0) as u64;
-        let w3 = ((inv_o3 / inv_sum) * 100.0) as u64;
-        let w4 = ((inv_o4 / inv_sum) * 100.0) as u64;
-        let w5 = ((inv_o5 / inv_sum) * 100.0) as u64;
-        let w6 = ((inv_o6 / inv_sum) * 100.0) as u64;
-        let w7 = ((inv_o7 / inv_sum) * 100.0) as u64;
+        let mut w0 = ((inv_o0 / inv_sum) * wscale) as u64;
+        let w1 = ((inv_o1 / inv_sum) * wscale) as u64;
+        let w2 = ((inv_o2 / inv_sum) * wscale) as u64;
+        let w3 = ((inv_o3 / inv_sum) * wscale) as u64;
+        let w4 = ((inv_o4 / inv_sum) * wscale) as u64;
+        let w5 = ((inv_o5 / inv_sum) * wscale) as u64;
+        let w6 = ((inv_o6 / inv_sum) * wscale) as u64;
+        let w7 = ((inv_o7 / inv_sum) * wscale) as u64;
+        if w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7 == 0 {
+            w0 = 1; // degenerate quantization (all floors zero) — fall back to order-0
+        }
         
         // Cumulative frequencies
         let o0_cum: u64 = o0_freqs[..sym].iter().sum();
@@ -1409,14 +1447,14 @@ pub fn range_encode_bytes_order_ewma7(data: &[u8]) -> Vec<u8> {
         let o6_err_delta = if o6_reliable { (actual_prob - o6_count as f64 / o6_total as f64).abs() } else { 0.5 };
         let o7_err_delta = if o7_reliable { (actual_prob - o7_count as f64 / o7_total as f64).abs() } else { 0.5 };
         
-        o0_err = (1.0 - EWMA_ALPHA) * o0_err + EWMA_ALPHA * o0_err_delta;
-        o1_err = (1.0 - EWMA_ALPHA) * o1_err + EWMA_ALPHA * o1_err_delta;
-        o2_err = (1.0 - EWMA_ALPHA) * o2_err + EWMA_ALPHA * o2_err_delta;
-        o3_err = (1.0 - EWMA_ALPHA) * o3_err + EWMA_ALPHA * o3_err_delta;
-        o4_err = (1.0 - EWMA_ALPHA) * o4_err + EWMA_ALPHA * o4_err_delta;
-        o5_err = (1.0 - EWMA_ALPHA) * o5_err + EWMA_ALPHA * o5_err_delta;
-        o6_err = (1.0 - EWMA_ALPHA) * o6_err + EWMA_ALPHA * o6_err_delta;
-        o7_err = (1.0 - EWMA_ALPHA) * o7_err + EWMA_ALPHA * o7_err_delta;
+        o0_err = (1.0 - alpha) * o0_err + alpha * o0_err_delta;
+        o1_err = (1.0 - alpha) * o1_err + alpha * o1_err_delta;
+        o2_err = (1.0 - alpha) * o2_err + alpha * o2_err_delta;
+        o3_err = (1.0 - alpha) * o3_err + alpha * o3_err_delta;
+        o4_err = (1.0 - alpha) * o4_err + alpha * o4_err_delta;
+        o5_err = (1.0 - alpha) * o5_err + alpha * o5_err_delta;
+        o6_err = (1.0 - alpha) * o6_err + alpha * o6_err_delta;
+        o7_err = (1.0 - alpha) * o7_err + alpha * o7_err_delta;
         
         // Update all models
         o0_freqs[sym] += 1; o0_total += 1;
@@ -1443,6 +1481,16 @@ pub fn range_encode_bytes_order_ewma7(data: &[u8]) -> Vec<u8> {
 
 /// Decode data encoded with O0+O1+O2+O3+O4+O5+O6+O7 EWMA mixing (sparse tables).
 pub fn range_decode_bytes_order_ewma7(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    range_decode_bytes_order_ewma7_alpha(data, EWMA_ALPHA)
+}
+
+/// Decode with custom EWMA decay factor (alpha) — must match encoder alpha.
+pub fn range_decode_bytes_order_ewma7_alpha(data: &[u8], alpha: f64) -> Result<Vec<u8>, &'static str> {
+    range_decode_bytes_order_ewma7_alpha_ws(data, alpha, 100.0)
+}
+
+/// Decode with custom alpha and mixing-weight scale — must match encoder.
+pub fn range_decode_bytes_order_ewma7_alpha_ws(data: &[u8], alpha: f64, wscale: f64) -> Result<Vec<u8>, &'static str> {
     if data.len() < 5 {
         return Err("Range decode: data too short");
     }
@@ -1510,14 +1558,17 @@ pub fn range_decode_bytes_order_ewma7(data: &[u8]) -> Result<Vec<u8>, &'static s
         let inv_o7 = if o7_reliable { 1.0 / (o7_err + 0.001) } else { 0.001 };
         let inv_sum = inv_o0 + inv_o1 + inv_o2 + inv_o3 + inv_o4 + inv_o5 + inv_o6 + inv_o7;
         
-        let w0 = ((inv_o0 / inv_sum) * 100.0) as u64;
-        let w1 = ((inv_o1 / inv_sum) * 100.0) as u64;
-        let w2 = ((inv_o2 / inv_sum) * 100.0) as u64;
-        let w3 = ((inv_o3 / inv_sum) * 100.0) as u64;
-        let w4 = ((inv_o4 / inv_sum) * 100.0) as u64;
-        let w5 = ((inv_o5 / inv_sum) * 100.0) as u64;
-        let w6 = ((inv_o6 / inv_sum) * 100.0) as u64;
-        let w7 = ((inv_o7 / inv_sum) * 100.0) as u64;
+        let mut w0 = ((inv_o0 / inv_sum) * wscale) as u64;
+        let w1 = ((inv_o1 / inv_sum) * wscale) as u64;
+        let w2 = ((inv_o2 / inv_sum) * wscale) as u64;
+        let w3 = ((inv_o3 / inv_sum) * wscale) as u64;
+        let w4 = ((inv_o4 / inv_sum) * wscale) as u64;
+        let w5 = ((inv_o5 / inv_sum) * wscale) as u64;
+        let w6 = ((inv_o6 / inv_sum) * wscale) as u64;
+        let w7 = ((inv_o7 / inv_sum) * wscale) as u64;
+        if w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7 == 0 {
+            w0 = 1; // degenerate quantization (all floors zero) — fall back to order-0
+        }
         
         let mixed_total = o0_total*w0 + o1_totals[o1_ctx]*w1 + o2_totals[o2_ctx]*w2
             + o3_total*w3 + o4_total*w4 + o5_total*w5 + o6_total*w6 + o7_total*w7;
@@ -1575,14 +1626,14 @@ pub fn range_decode_bytes_order_ewma7(data: &[u8]) -> Result<Vec<u8>, &'static s
         let o6_err_delta = if o6_reliable { let c = o6_freqs[o6_idx][sym as usize]; let t = o6_totals[o6_idx]; (actual_prob - c as f64 / t.max(1) as f64).abs() } else { 0.5 };
         let o7_err_delta = if o7_reliable { let c = o7_freqs[o7_idx][sym as usize]; let t = o7_totals[o7_idx]; (actual_prob - c as f64 / t.max(1) as f64).abs() } else { 0.5 };
         
-        o0_err = (1.0 - EWMA_ALPHA) * o0_err + EWMA_ALPHA * o0_err_delta;
-        o1_err = (1.0 - EWMA_ALPHA) * o1_err + EWMA_ALPHA * o1_err_delta;
-        o2_err = (1.0 - EWMA_ALPHA) * o2_err + EWMA_ALPHA * o2_err_delta;
-        o3_err = (1.0 - EWMA_ALPHA) * o3_err + EWMA_ALPHA * o3_err_delta;
-        o4_err = (1.0 - EWMA_ALPHA) * o4_err + EWMA_ALPHA * o4_err_delta;
-        o5_err = (1.0 - EWMA_ALPHA) * o5_err + EWMA_ALPHA * o5_err_delta;
-        o6_err = (1.0 - EWMA_ALPHA) * o6_err + EWMA_ALPHA * o6_err_delta;
-        o7_err = (1.0 - EWMA_ALPHA) * o7_err + EWMA_ALPHA * o7_err_delta;
+        o0_err = (1.0 - alpha) * o0_err + alpha * o0_err_delta;
+        o1_err = (1.0 - alpha) * o1_err + alpha * o1_err_delta;
+        o2_err = (1.0 - alpha) * o2_err + alpha * o2_err_delta;
+        o3_err = (1.0 - alpha) * o3_err + alpha * o3_err_delta;
+        o4_err = (1.0 - alpha) * o4_err + alpha * o4_err_delta;
+        o5_err = (1.0 - alpha) * o5_err + alpha * o5_err_delta;
+        o6_err = (1.0 - alpha) * o6_err + alpha * o6_err_delta;
+        o7_err = (1.0 - alpha) * o7_err + alpha * o7_err_delta;
         
         // Update models
         o0_freqs[sym as usize] += 1; o0_total += 1;
@@ -2330,7 +2381,7 @@ mod tests {
     fn test_order_ewma5_roundtrip_simple() {
         let data = b"hello world";
         let encoded = range_encode_bytes_order_ewma5(data);
-        let decoded = range_decode_bytes_order_ewma5(&encoded).expect("range decode O5 should succeed");
+        let decoded = range_decode_bytes_order_ewma5(&encoded, None).expect("range decode O5 should succeed");
         assert_eq!(decoded, data);
     }
     
@@ -2339,7 +2390,7 @@ mod tests {
         let data: Vec<u8> = b"The quick brown fox jumps over the lazy dog. ".iter()
             .cycle().take(1000).copied().collect();
         let encoded = range_encode_bytes_order_ewma5(&data);
-        let decoded = range_decode_bytes_order_ewma5(&encoded).expect("range decode O5 should succeed");
+        let decoded = range_decode_bytes_order_ewma5(&encoded, None).expect("range decode O5 should succeed");
         assert_eq!(decoded, data);
     }
     
@@ -2347,7 +2398,7 @@ mod tests {
     fn test_order_ewma5_roundtrip_empty() {
         let data: Vec<u8> = vec![];
         let encoded = range_encode_bytes_order_ewma5(&data);
-        let decoded = range_decode_bytes_order_ewma5(&encoded).expect("range decode O5 empty should succeed");
+        let decoded = range_decode_bytes_order_ewma5(&encoded, None).expect("range decode O5 empty should succeed");
         assert_eq!(decoded, data);
     }
     
@@ -2362,7 +2413,7 @@ mod tests {
         }
         
         let encoded = range_encode_bytes_order_ewma5(&data);
-        let decoded = range_decode_bytes_order_ewma5(&encoded).expect("range decode O5 random should succeed");
+        let decoded = range_decode_bytes_order_ewma5(&encoded, None).expect("range decode O5 random should succeed");
         assert_eq!(decoded, data);
     }
     
