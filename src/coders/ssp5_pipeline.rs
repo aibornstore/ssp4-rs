@@ -11,7 +11,8 @@
 
 use super::bwt::{bwt_encode, bwt_decode, pack_bwt, unpack_bwt, 
                  bwt_encode_chunked, bwt_decode_chunked, bwt_encode_iterative};
-use super::mtf::{mtf_encode, mtf_decode, mtf_encode_bwt_chunked, mtf_decode_bwt_chunked};
+use super::mtf::{mtf_encode, mtf_decode, mtf_encode_bwt_chunked, mtf_decode_bwt_chunked,
+                 zrun_encode, zrun_decode};
 use super::ssp_codec::{encode as ssp_encode, decode as ssp_decode};
 use super::lz77::{encode as lz77_encode, decode as lz77_decode, Token};
 use super::range_coder::{range_encode_bytes, range_decode_bytes, 
@@ -805,19 +806,21 @@ pub fn ssp5_decode_with_range_coder_ewma7(archive: &[u8]) -> Result<Vec<u8>, &'s
         return Err("Invalid wrapper version for EWMA7 range coder");
     }
 
-    // Version 21: [MAGIC(4)][21][alpha f64 (8)][wscale f64 (8)][primary(4)][mtf_len(4)][rc]
-    let (alpha, wscale, data_start) = if archive[4] == WRAPPER_VERSION_RC_EWMA7_ALPHA {
-        if archive.len() < 29 {
+    // Version 21: [MAGIC(4)][21][flags(1)][alpha f64 (8)][wscale f64 (8)][primary(4)][mtf_len(4)][rc]
+    // flags bit0: zero-run escape applied to MTF stream before range coding
+    let (alpha, wscale, zrun, data_start) = if archive[4] == WRAPPER_VERSION_RC_EWMA7_ALPHA {
+        if archive.len() < 30 {
             return Err("Archive too short for alpha header");
         }
+        let flags = archive[5];
         let mut a = [0u8; 8];
-        a.copy_from_slice(&archive[5..13]);
+        a.copy_from_slice(&archive[6..14]);
         let mut w = [0u8; 8];
-        w.copy_from_slice(&archive[13..21]);
-        (f64::from_le_bytes(a), f64::from_le_bytes(w), 21)
+        w.copy_from_slice(&archive[14..22]);
+        (f64::from_le_bytes(a), f64::from_le_bytes(w), flags & 1 != 0, 22)
     } else {
         // Version 18: [MAGIC(4)][18][primary(4)][mtf_len(4)][rc]
-        (EWMA_ALPHA_DEFAULT, 100.0, 5)
+        (EWMA_ALPHA_DEFAULT, 100.0, false, 5)
     };
 
     if archive.len() < data_start + 8 {
@@ -828,11 +831,12 @@ pub fn ssp5_decode_with_range_coder_ewma7(archive: &[u8]) -> Result<Vec<u8>, &'s
     let rc_data = &archive[data_start+8..];
 
     // Version 18 uses uniform prior (legacy), version 21 uses tuned prior — must match encoder
-    let mtf_data = if archive[4] == WRAPPER_VERSION_RC_EWMA7_ALPHA {
+    let rc_out = if archive[4] == WRAPPER_VERSION_RC_EWMA7_ALPHA {
         range_decode_bytes_order_ewma7_alpha_ws(rc_data, alpha, wscale)?
     } else {
         range_decode_bytes_order_ewma7(rc_data)?
     };
+    let mtf_data = if zrun { zrun_decode(&rc_out) } else { rc_out };
     if mtf_data.len() != mtf_len {
         return Err("MTF length mismatch");
     }
@@ -853,19 +857,30 @@ pub fn ssp5_encode_with_range_coder_ewma7_alpha(data: &[u8], alpha: f64) -> Vec<
     ssp5_encode_with_range_coder_ewma7_alpha_ws(data, alpha, 100.0)
 }
 
-/// Encode with explicit alpha and mixing-weight scale. Archive stores both (version 21).
+/// Encode with explicit alpha and mixing-weight scale (no zero-run escape).
 pub fn ssp5_encode_with_range_coder_ewma7_alpha_ws(data: &[u8], alpha: f64, wscale: f64) -> Vec<u8> {
+    ssp5_encode_with_range_coder_ewma7_alpha_ws_zr(data, alpha, wscale, false)
+}
+
+/// Encode with explicit alpha, weight scale, and optional zero-run escape (flags bit0).
+/// Zero-run escape collapses runs of 0x00 in the MTF stream: [00][00][uleb(k-2)].
+pub fn ssp5_encode_with_range_coder_ewma7_alpha_ws_zr(data: &[u8], alpha: f64, wscale: f64, zrun: bool) -> Vec<u8> {
     if data.is_empty() {
         return Vec::new();
     }
     let (primary, bwt_data) = bwt_encode(data);
     let bwt_packed = pack_bwt(primary, &bwt_data);
     let mtf_data = mtf_encode(&bwt_packed);
-    let rc_data = range_encode_bytes_order_ewma7_alpha_ws(&mtf_data, alpha, wscale);
+    let rc_data = if zrun {
+        range_encode_bytes_order_ewma7_alpha_ws(&zrun_encode(&mtf_data), alpha, wscale)
+    } else {
+        range_encode_bytes_order_ewma7_alpha_ws(&mtf_data, alpha, wscale)
+    };
 
-    let mut out = Vec::with_capacity(29 + rc_data.len());
+    let mut out = Vec::with_capacity(30 + rc_data.len());
     out.extend_from_slice(WRAPPER_MAGIC);
     out.push(WRAPPER_VERSION_RC_EWMA7_ALPHA);
+    out.push(zrun as u8); // flags
     out.extend_from_slice(&alpha.to_le_bytes());
     out.extend_from_slice(&wscale.to_le_bytes());
     out.extend_from_slice(&(primary as u32).to_le_bytes());
@@ -874,16 +889,22 @@ pub fn ssp5_encode_with_range_coder_ewma7_alpha_ws(data: &[u8], alpha: f64, wsca
     out
 }
 
-/// Auto-tune: try (alpha, wscale) candidates and keep the smallest archive.
+/// Auto-tune: try (alpha, wscale, zrun) candidates and keep the smallest archive.
 /// Base candidate is the plain version-18 archive (13-byte header) — it wins whenever
 /// the default config (0.05, 100) is optimal, avoiding the 16-byte v21 param overhead.
-/// (0.05, 6.0) wins on binary/spreadsheet (kennedy.xls 9.84%); (0.1, 100.0) on text (alice29 30.78%);
-/// chunking tested and LOSSES to non-chunked with tuned weights.
+/// (0.05, 6, zrun) wins on binary/spreadsheet (kennedy.xls 9.51%); (0.1, 100, plain) on text
+/// (alice29 30.68%); (0.1, 100, zrun) on small text (cp.html, fields.c).
 pub fn ssp5_encode_with_range_coder_ewma7_auto(data: &[u8]) -> Vec<u8> {
     let mut best = ssp5_encode_with_range_coder_ewma7(data); // (0.05, 100.0) in v18 format
-    let candidates = [(0.05f64, 6.0f64), (0.001, 7.0), (0.05, 100.0), (0.1, 100.0)];
-    for &(alpha, wscale) in &candidates {
-        let enc = ssp5_encode_with_range_coder_ewma7_alpha_ws(data, alpha, wscale);
+    let candidates = [
+        (0.05f64, 6.0f64, true),
+        (0.05, 6.0, false),
+        (0.1, 100.0, true),
+        (0.1, 100.0, false),
+        (0.05, 100.0, false),
+    ];
+    for &(alpha, wscale, zrun) in &candidates {
+        let enc = ssp5_encode_with_range_coder_ewma7_alpha_ws_zr(data, alpha, wscale, zrun);
         if enc.len() < best.len() {
             best = enc;
         }

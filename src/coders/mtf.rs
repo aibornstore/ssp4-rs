@@ -411,6 +411,213 @@ pub fn unpack_mtf(data: &[u8]) -> (usize, &[u8]) {
     (orig_len, mtf_data)
 }
 
+// === RLE1: run-length of repeated bytes (bzip2-style), applied to MTF output ===
+// Format (bit-packed, MSB-first):
+//   literal: [0][byte:8]
+//   run:     [1][sym:8][uleb(k-2): 8 bits per group, continuation bit + 7 bits]
+// Trailing bits are zero-padded to a byte boundary.
+
+/// RLE1-encode a byte stream, collapsing runs of length >= 2.
+pub fn rle1_encode(data: &[u8]) -> Vec<u8> {
+    let mut bits: Vec<u8> = Vec::with_capacity(data.len() + data.len() / 8 + 16);
+    let mut i = 0;
+    while i < data.len() {
+        let mut j = i + 1;
+        while j < data.len() && data[j] == data[i] {
+            j += 1;
+        }
+        let k = j - i;
+        if k >= 2 {
+            bits.push(1);
+            let sym = data[i];
+            for b in (0..8).rev() {
+                bits.push((sym >> b) & 1);
+            }
+            let mut v = (k - 2) as u32;
+            loop {
+                if v >= 0x80 {
+                    bits.push(1);
+                    let seven = (v & 0x7f) as u8;
+                    for b in (0..7).rev() {
+                        bits.push((seven >> b) & 1);
+                    }
+                    v >>= 7;
+                } else {
+                    bits.push(0);
+                    let seven = v as u8;
+                    for b in (0..7).rev() {
+                        bits.push((seven >> b) & 1);
+                    }
+                    break;
+                }
+            }
+            i = j;
+        } else {
+            bits.push(0);
+            for b in (0..8).rev() {
+                bits.push((data[i] >> b) & 1);
+            }
+            i += 1;
+        }
+    }
+    let mut out = Vec::with_capacity((bits.len() + 7) / 8);
+    for chunk in bits.chunks(8) {
+        let mut byte = 0u8;
+        for (idx, &bit) in chunk.iter().enumerate() {
+            byte |= bit << (7 - idx);
+        }
+        out.push(byte);
+    }
+    out
+}
+
+/// Decode stream produced by rle1_encode back to the original bytes.
+pub fn rle1_decode(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() * 2);
+    let total_bits = data.len() * 8;
+    let mut bitpos = 0usize;
+
+    let get_bit = |pos: usize| -> u32 {
+        if pos >= total_bits {
+            0
+        } else {
+            ((data[pos / 8] >> (7 - (pos % 8))) & 1) as u32
+        }
+    };
+
+    while bitpos < total_bits {
+        let mode = get_bit(bitpos);
+        bitpos += 1;
+        if mode == 0 {
+            if bitpos + 8 > total_bits {
+                break; // zero padding
+            }
+            let mut byte = 0u8;
+            for _ in 0..8 {
+                byte = (byte << 1) | get_bit(bitpos) as u8;
+                bitpos += 1;
+            }
+            out.push(byte);
+        } else {
+            if bitpos + 8 > total_bits {
+                break;
+            }
+            let mut sym = 0u8;
+            for _ in 0..8 {
+                sym = (sym << 1) | get_bit(bitpos) as u8;
+                bitpos += 1;
+            }
+            let mut v = 0u32;
+            let mut shift = 0u32;
+            loop {
+                if bitpos >= total_bits || shift > 28 {
+                    return out; // truncated input — return what we have
+                }
+                let cont = get_bit(bitpos);
+                bitpos += 1;
+                let mut seven = 0u32;
+                for _ in 0..7 {
+                    seven = (seven << 1) | get_bit(bitpos);
+                    bitpos += 1;
+                }
+                v |= seven << shift;
+                if cont == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            let k = v as usize + 2;
+            for _ in 0..k {
+                out.push(sym);
+            }
+        }
+    }
+    out
+}
+
+// === Zero-run escape (byte-aligned): runs of 0x00 -> [00][00][uleb(k-2)] ===
+// Encoder never emits two raw adjacent zeros (any run >= 2 becomes a token),
+// so [00][00] unambiguously starts a token; [00][nonzero] is a literal zero.
+// All other bytes pass through unchanged — byte-level context stays intact.
+
+/// Encode zero runs in a byte stream.
+pub fn zrun_encode(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0 {
+            let mut j = i;
+            while j < data.len() && data[j] == 0 {
+                j += 1;
+            }
+            let k = j - i;
+            if k >= 2 {
+                out.push(0);
+                out.push(0);
+                let mut v = (k - 2) as u32;
+                loop {
+                    if v >= 0x80 {
+                        out.push(((v & 0x7f) | 0x80) as u8);
+                        v >>= 7;
+                    } else {
+                        out.push(v as u8);
+                        break;
+                    }
+                }
+            } else {
+                out.push(0); // single literal zero (followed by nonzero by construction)
+            }
+            i = j;
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Decode stream produced by zrun_encode back to the original bytes.
+pub fn zrun_decode(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() * 2);
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0 {
+            if i + 1 < data.len() && data[i + 1] == 0 {
+                // token: [00][00][uleb(k-2)]
+                i += 2;
+                let mut v = 0u32;
+                let mut shift = 0u32;
+                loop {
+                    if i >= data.len() {
+                        return out;
+                    }
+                    let b = data[i];
+                    i += 1;
+                    v |= ((b & 0x7f) as u32) << shift;
+                    if b & 0x80 == 0 {
+                        break;
+                    }
+                    shift += 7;
+                    if shift > 28 {
+                        break;
+                    }
+                }
+                let k = v as usize + 2;
+                for _ in 0..k {
+                    out.push(0);
+                }
+            } else {
+                out.push(0);
+                i += 1;
+            }
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

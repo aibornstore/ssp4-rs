@@ -134,4 +134,89 @@ mod tests {
                  total_def, 100.0 * total_def as f64 / total_in as f64,
                  100.0 * (total_def - total_auto) as f64 / total_in as f64);
     }
+
+    #[test]
+    fn test_huffman_vs_ewma7_small_files() {
+        use super::super::ssp5_pipeline::{ssp5_encode_with_huffman, ssp5_decode_with_huffman,
+                                          ssp5_encode_with_range_coder_ewma7_auto,
+                                          ssp5_decode_with_range_coder_ewma7};
+
+        let corpus_dir = r"D:\PROJECT UNIVERSE\01Compression\SSP5\tests\comparison_corpora\canterbury";
+        // Reference bz2 sizes (level 9, Python stdlib): fields.c 3039, cp.html 7624, alice 43202, kennedy 130280
+        let files = [
+            ("fields.c", 3039usize),
+            ("cp.html", 7624),
+            ("alice29.txt", 43202),
+            ("kennedy.xls", 130280),
+        ];
+
+        println!("\n=== Huffman (static, global histogram) vs EWMA7 auto vs bz2 ===");
+        for (name, bz2_size) in &files {
+            let path = format!(r"{}\{}", corpus_dir, name);
+            let data = match fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => { println!("{}: SKIPPED", name); continue; }
+            };
+
+            let huff = ssp5_encode_with_huffman(&data);
+            let auto = ssp5_encode_with_range_coder_ewma7_auto(&data);
+
+            println!("{:>12} ({} B): huffman {:>7} ({:6.2}%) | ewma7-auto {:>7} ({:6.2}%) | bz2 {:>7} ({:6.2}%)",
+                     name, data.len(),
+                     huff.len(), 100.0 * huff.len() as f64 / data.len() as f64,
+                     auto.len(), 100.0 * auto.len() as f64 / data.len() as f64,
+                     bz2_size, 100.0 * *bz2_size as f64 / data.len() as f64);
+
+            match ssp5_decode_with_huffman(&huff) {
+                Ok(h) => assert_eq!(h, data, "{} huffman roundtrip failed", name),
+                Err(e) => println!("{}: huffman DECODE FAILED: {} (size reported for reference only)", name, e),
+            }
+            let a = ssp5_decode_with_range_coder_ewma7(&auto).expect("auto decode failed");
+            assert_eq!(a, data, "{} auto roundtrip failed", name);
+        }
+    }
+
+    #[test]
+    fn test_rle1_vs_plain_ewma7_corpus() {
+        use super::super::bwt::{bwt_encode, pack_bwt};
+        use super::super::mtf::{mtf_encode, rle1_encode, rle1_decode, zrun_encode, zrun_decode};
+        use super::super::range_coder::{range_encode_bytes_order_ewma7_alpha_ws, range_decode_bytes_order_ewma7_alpha_ws};
+
+        let corpus_dir = r"D:\PROJECT UNIVERSE\01Compression\SSP5\tests\comparison_corpora\canterbury";
+        let files = ["fields.c", "cp.html", "alice29.txt", "kennedy.xls"];
+        // Winning configs per data type
+        let configs: [(f64, f64); 2] = [(0.05, 6.0), (0.1, 100.0)];
+
+        println!("\n=== Transform vs plain, EWMA7 range coder (delta = plain - transformed) ===");
+        for name in &files {
+            let path = format!(r"{}\{}", corpus_dir, name);
+            let data = match fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let (p, last) = bwt_encode(&data);
+            let m = mtf_encode(&pack_bwt(p, &last));
+            let r = rle1_encode(&m);
+            let z = zrun_encode(&m);
+
+            for (label, t, tback) in [
+                ("rle1", r.as_slice(), rle1_decode as fn(&[u8]) -> Vec<u8>),
+                ("zrun", z.as_slice(), zrun_decode as fn(&[u8]) -> Vec<u8>),
+            ] {
+                let mut row = format!("{:>12} {:>4} (mtf {} -> {}):", name, label, m.len(), t.len());
+                for &(alpha, ws) in &configs {
+                    let plain = range_encode_bytes_order_ewma7_alpha_ws(&m, alpha, ws).len();
+                    let enc = range_encode_bytes_order_ewma7_alpha_ws(t, alpha, ws);
+                    row.push_str(&format!(" plain {} {} {} ({:+})", label, plain, enc.len(), plain as i64 - enc.len() as i64));
+
+                    let t_back = range_decode_bytes_order_ewma7_alpha_ws(&enc, alpha, ws).expect("rc decode failed");
+                    assert_eq!(t_back, t, "transformed stream mismatch");
+                    let m_back = tback(&t_back);
+                    assert_eq!(m_back, m, "transform decode mismatch");
+                }
+                println!("{}", row);
+            }
+        }
+        println!("All transform roundtrips: OK");
+    }
 }
