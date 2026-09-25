@@ -1295,17 +1295,23 @@ pub fn range_decode_bytes_order_ewma5_with_count(data: &[u8], count: usize) -> R
 }
 
 /// Encode data with adaptive O0+O1+O2+O3+O4+O5+O6+O7 EWMA mixing (sparse tables).
+/// Legacy path: uniform O0 prior (kept for v18/chunked archives).
 pub fn range_encode_bytes_order_ewma7(data: &[u8]) -> Vec<u8> {
-    range_encode_bytes_order_ewma7_alpha(data, EWMA_ALPHA)
+    range_encode_bytes_order_ewma7_full(data, EWMA_ALPHA, 100.0, 0)
 }
 
-/// Encode with custom EWMA decay factor (alpha) for parameter sweeps.
+/// Encode with custom EWMA decay factor (alpha), tuned prior (1024) for parameter sweeps.
 pub fn range_encode_bytes_order_ewma7_alpha(data: &[u8], alpha: f64) -> Vec<u8> {
-    range_encode_bytes_order_ewma7_alpha_ws(data, alpha, 100.0)
+    range_encode_bytes_order_ewma7_full(data, alpha, 100.0, 1024)
 }
 
-/// Encode with custom alpha and mixing-weight scale (granularity of w quantization).
+/// Encode with custom alpha and mixing-weight scale, tuned prior (1024).
 pub fn range_encode_bytes_order_ewma7_alpha_ws(data: &[u8], alpha: f64, wscale: f64) -> Vec<u8> {
+    range_encode_bytes_order_ewma7_full(data, alpha, wscale, 1024)
+}
+
+/// Full parametrization: decay factor, weight scale, O0 prior strength (0 = uniform).
+pub fn range_encode_bytes_order_ewma7_full(data: &[u8], alpha: f64, wscale: f64, prior_k: u64) -> Vec<u8> {
     if data.is_empty() {
         let mut out = Vec::new();
         out.push(9); // flag: O0+O1+O2+O3+O4+O5+O6+O7 EWMA
@@ -1315,9 +1321,14 @@ pub fn range_encode_bytes_order_ewma7_alpha_ws(data: &[u8], alpha: f64, wscale: 
     
     let mut enc = RangeEncoder::new();
     
-    // O0 model
+    // O0 model — optional log-decay prior: MTF indices skew low, uniform prior wastes warmup bits
     let mut o0_freqs = [1u64; 256];
-    let mut o0_total: u64 = 256;
+    if prior_k > 0 {
+        for (s, f) in o0_freqs.iter_mut().enumerate() {
+            *f = 1 + prior_k / (s as u64 + 1);
+        }
+    }
+    let mut o0_total: u64 = o0_freqs.iter().sum();
     
     // O1 model
     let mut o1_freqs = [[1u64; 256]; 256];
@@ -1480,17 +1491,23 @@ pub fn range_encode_bytes_order_ewma7_alpha_ws(data: &[u8], alpha: f64, wscale: 
 }
 
 /// Decode data encoded with O0+O1+O2+O3+O4+O5+O6+O7 EWMA mixing (sparse tables).
+/// Legacy path: uniform O0 prior (matches range_encode_bytes_order_ewma7).
 pub fn range_decode_bytes_order_ewma7(data: &[u8]) -> Result<Vec<u8>, &'static str> {
-    range_decode_bytes_order_ewma7_alpha(data, EWMA_ALPHA)
+    range_decode_bytes_order_ewma7_full(data, EWMA_ALPHA, 100.0, 0)
 }
 
-/// Decode with custom EWMA decay factor (alpha) — must match encoder alpha.
+/// Decode with custom EWMA decay factor (alpha), tuned prior (1024) — must match encoder.
 pub fn range_decode_bytes_order_ewma7_alpha(data: &[u8], alpha: f64) -> Result<Vec<u8>, &'static str> {
-    range_decode_bytes_order_ewma7_alpha_ws(data, alpha, 100.0)
+    range_decode_bytes_order_ewma7_full(data, alpha, 100.0, 1024)
 }
 
-/// Decode with custom alpha and mixing-weight scale — must match encoder.
+/// Decode with custom alpha and mixing-weight scale, tuned prior (1024) — must match encoder.
 pub fn range_decode_bytes_order_ewma7_alpha_ws(data: &[u8], alpha: f64, wscale: f64) -> Result<Vec<u8>, &'static str> {
+    range_decode_bytes_order_ewma7_full(data, alpha, wscale, 1024)
+}
+
+/// Full parametrization: decay factor, weight scale, O0 prior strength (0 = uniform).
+pub fn range_decode_bytes_order_ewma7_full(data: &[u8], alpha: f64, wscale: f64, prior_k: u64) -> Result<Vec<u8>, &'static str> {
     if data.len() < 5 {
         return Err("Range decode: data too short");
     }
@@ -1504,9 +1521,15 @@ pub fn range_decode_bytes_order_ewma7_alpha_ws(data: &[u8], alpha: f64, wscale: 
     
     let mut dec = RangeDecoder::new(range_data);
     let mut out = Vec::with_capacity(count);
-    
+
+    // O0 prior — must match encoder exactly
     let mut o0_freqs = [1u64; 256];
-    let mut o0_total: u64 = 256;
+    if prior_k > 0 {
+        for (s, f) in o0_freqs.iter_mut().enumerate() {
+            *f = 1 + prior_k / (s as u64 + 1);
+        }
+    }
+    let mut o0_total: u64 = o0_freqs.iter().sum();
     let mut o1_freqs = [[1u64; 256]; 256];
     let mut o1_totals = [256u64; 256];
     let mut o2_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; 256 * 256];

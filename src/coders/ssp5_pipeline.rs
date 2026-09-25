@@ -827,7 +827,12 @@ pub fn ssp5_decode_with_range_coder_ewma7(archive: &[u8]) -> Result<Vec<u8>, &'s
     let mtf_len = u32::from_le_bytes([archive[data_start+4], archive[data_start+5], archive[data_start+6], archive[data_start+7]]) as usize;
     let rc_data = &archive[data_start+8..];
 
-    let mtf_data = range_decode_bytes_order_ewma7_alpha_ws(rc_data, alpha, wscale)?;
+    // Version 18 uses uniform prior (legacy), version 21 uses tuned prior — must match encoder
+    let mtf_data = if archive[4] == WRAPPER_VERSION_RC_EWMA7_ALPHA {
+        range_decode_bytes_order_ewma7_alpha_ws(rc_data, alpha, wscale)?
+    } else {
+        range_decode_bytes_order_ewma7(rc_data)?
+    };
     if mtf_data.len() != mtf_len {
         return Err("MTF length mismatch");
     }
@@ -876,7 +881,7 @@ pub fn ssp5_encode_with_range_coder_ewma7_alpha_ws(data: &[u8], alpha: f64, wsca
 /// chunking tested and LOSSES to non-chunked with tuned weights.
 pub fn ssp5_encode_with_range_coder_ewma7_auto(data: &[u8]) -> Vec<u8> {
     let mut best = ssp5_encode_with_range_coder_ewma7(data); // (0.05, 100.0) in v18 format
-    let candidates = [(0.05f64, 6.0f64), (0.001, 7.0), (0.1, 100.0)];
+    let candidates = [(0.05f64, 6.0f64), (0.001, 7.0), (0.05, 100.0), (0.1, 100.0)];
     for &(alpha, wscale) in &candidates {
         let enc = ssp5_encode_with_range_coder_ewma7_alpha_ws(data, alpha, wscale);
         if enc.len() < best.len() {
