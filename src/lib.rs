@@ -17,5 +17,6 @@ pub use coders::ssp5_pipeline::{
     ssp5_encode_with_options,
     ssp5_encode_with_range_coder_ewma7, ssp5_decode_with_range_coder_ewma7,
     ssp5_encode_with_range_coder_ewma7_alpha, ssp5_encode_with_range_coder_ewma7_auto,
+    ssp5_encode_with_range_coder_ewma7_v18,
 };
 pub use coders::lz77::{encode as lz77_encode, decode as lz77_decode};

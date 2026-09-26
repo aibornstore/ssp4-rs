@@ -40,6 +40,7 @@ const WRAPPER_VERSION_HUFFMAN: u8 = 17; // Version 17 uses Huffman coder on BWT+
 const WRAPPER_VERSION_RC_EWMA7: u8 = 18; // Version 18 uses range coder (O0-O7 EWMA)
 const WRAPPER_VERSION_RC_EWMA7_CHUNKED: u8 = 20; // Version 20: chunked BWT + per-chunk EWMA7
 const WRAPPER_VERSION_RC_EWMA7_ALPHA: u8 = 21; // Version 21: EWMA7 with explicit alpha in header
+const WRAPPER_VERSION_RC_EWMA7_ZRUN: u8 = 19;   // Version 19: compact zrun header (14B)
 const DEFAULT_CHUNK_SIZE_EWMA7: usize = 64 * 1024; // 64 KB - optimal for kennedy.xls
 
 /// Encode data with SSP5 pipeline: BWT → MTF → SSP (no LZ77)
@@ -775,7 +776,19 @@ pub fn ssp5_decode_with_range_coder_ewma5_rle(archive: &[u8]) -> Result<Vec<u8>,
 }
 
 /// Encode data with BWT → MTF → RangeCoder O0+O1+O2+O3+O4+O5+O6+O7 EWMA pipeline.
+/// DEFAULT: uses auto-tuning (tries 18 (alpha,wscale,zrun) candidates with v18/v19/v21 headers).
+/// Falls back to legacy v18 (0.05, 100) for compatibility with old archives.
 pub fn ssp5_encode_with_range_coder_ewma7(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    // Use auto-tuned EWMA7 as default — better compression across all file sizes
+    ssp5_encode_with_range_coder_ewma7_auto(data)
+}
+
+/// Legacy v18 baseline encoder: BWT → MTF → range_encode_bytes_order_ewma7 (0.05, 100).
+/// Used as fallback in auto-tuning and for compatibility with old archives.
+pub fn ssp5_encode_with_range_coder_ewma7_v18(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
         return Vec::new();
     }
@@ -783,7 +796,7 @@ pub fn ssp5_encode_with_range_coder_ewma7(data: &[u8]) -> Vec<u8> {
     let bwt_packed = pack_bwt(primary, &bwt_data);
     let mtf_data = mtf_encode(&bwt_packed);
     let rc_data = range_encode_bytes_order_ewma7(&mtf_data);
-    
+
     let mut out = Vec::with_capacity(13 + rc_data.len());
     out.extend_from_slice(WRAPPER_MAGIC);
     out.push(WRAPPER_VERSION_RC_EWMA7);
@@ -794,7 +807,7 @@ pub fn ssp5_encode_with_range_coder_ewma7(data: &[u8]) -> Vec<u8> {
 }
 
 /// Decode data from BWT → MTF →RangeCoder O0+O1+O2+O3+O4+O5+O6+O7 EWMA pipeline.
-/// Accepts version 18 (implicit EWMA_ALPHA) and version 21 (explicit alpha in header).
+/// Accepts version 18 (implicit EWMA_ALPHA), version 19 (compact zrun), and version 21 (explicit alpha).
 pub fn ssp5_decode_with_range_coder_ewma7(archive: &[u8]) -> Result<Vec<u8>, &'static str> {
     if archive.is_empty() {
         return Ok(Vec::new());
@@ -802,12 +815,36 @@ pub fn ssp5_decode_with_range_coder_ewma7(archive: &[u8]) -> Result<Vec<u8>, &'s
     if &archive[0..4] != WRAPPER_MAGIC {
         return Err("Invalid wrapper magic");
     }
+
+    // Version 19: [MAGIC(4)][19][cfg(1)][primary(4)][mtf_len(4)][rc] = 14 bytes
+    if archive[4] == WRAPPER_VERSION_RC_EWMA7_ZRUN {
+        if archive.len() < 15 {
+            return Err("Archive too short for v19");
+        }
+        let cfg = archive[5];
+        let (alpha, wscale, zrun) = config_to_params(cfg);
+        let primary = u32::from_le_bytes([archive[6], archive[7], archive[8], archive[9]]) as usize;
+        let mtf_len = u32::from_le_bytes([archive[10], archive[11], archive[12], archive[13]]) as usize;
+        let rc_data = &archive[14..];
+        let rc_out = range_decode_bytes_order_ewma7_alpha_ws(rc_data, alpha, wscale)?;
+        let mtf_data = if zrun { zrun_decode(&rc_out) } else { rc_out };
+        if mtf_data.len() != mtf_len {
+            return Err("MTF length mismatch");
+        }
+        let bwt_decoded = mtf_decode(&mtf_data);
+        let (dec_primary, dec_bwt) = unpack_bwt(&bwt_decoded);
+        if dec_primary as u32 != primary as u32 {
+            return Err("BWT primary index mismatch");
+        }
+        return Ok(bwt_decode(dec_primary, &dec_bwt));
+    }
+
+    // Version 21: [MAGIC(4)][21][flags(1)][alpha f64 (8)][wscale f64 (8)][primary(4)][mtf_len(4)][rc]
     if archive[4] != WRAPPER_VERSION_RC_EWMA7 && archive[4] != WRAPPER_VERSION_RC_EWMA7_ALPHA {
         return Err("Invalid wrapper version for EWMA7 range coder");
     }
 
-    // Version 21: [MAGIC(4)][21][flags(1)][alpha f64 (8)][wscale f64 (8)][primary(4)][mtf_len(4)][rc]
-    // flags bit0: zero-run escape applied to MTF stream before range coding
+    // Version 21 format...
     let (alpha, wscale, zrun, data_start) = if archive[4] == WRAPPER_VERSION_RC_EWMA7_ALPHA {
         if archive.len() < 30 {
             return Err("Archive too short for alpha header");
@@ -819,7 +856,6 @@ pub fn ssp5_decode_with_range_coder_ewma7(archive: &[u8]) -> Result<Vec<u8>, &'s
         w.copy_from_slice(&archive[14..22]);
         (f64::from_le_bytes(a), f64::from_le_bytes(w), flags & 1 != 0, 22)
     } else {
-        // Version 18: [MAGIC(4)][18][primary(4)][mtf_len(4)][rc]
         (EWMA_ALPHA_DEFAULT, 100.0, false, 5)
     };
 
@@ -830,7 +866,6 @@ pub fn ssp5_decode_with_range_coder_ewma7(archive: &[u8]) -> Result<Vec<u8>, &'s
     let mtf_len = u32::from_le_bytes([archive[data_start+4], archive[data_start+5], archive[data_start+6], archive[data_start+7]]) as usize;
     let rc_data = &archive[data_start+8..];
 
-    // Version 18 uses uniform prior (legacy), version 21 uses tuned prior — must match encoder
     let rc_out = if archive[4] == WRAPPER_VERSION_RC_EWMA7_ALPHA {
         range_decode_bytes_order_ewma7_alpha_ws(rc_data, alpha, wscale)?
     } else {
@@ -851,6 +886,57 @@ pub fn ssp5_decode_with_range_coder_ewma7(archive: &[u8]) -> Result<Vec<u8>, &'s
 
 /// Default EWMA alpha used by version-18 archives (must match range_coder::EWMA_ALPHA).
 const EWMA_ALPHA_DEFAULT: f64 = 0.05;
+
+/// v19 config byte lookup: (alpha_idx << 3) | (wscale_idx << 1) | zrun_bit
+/// alpha_idx: 0=0.05, 1=0.1, 2=0.001, 3=0.0001, 4=0.0005
+/// wscale_idx: 0=100, 1=6, 2=10, 3=50
+/// Returns (alpha, wscale, zrun)
+fn config_to_params(cfg: u8) -> (f64, f64, bool) {
+    let alpha_idx = (cfg >> 3) & 0x07;
+    let wscale_idx = (cfg >> 1) & 0x03;
+    let zrun = (cfg & 0x01) != 0;
+    let alpha = match alpha_idx {
+        0 => 0.05, 1 => 0.1, 2 => 0.001, 3 => 0.0001, 4 => 0.0005, _ => 0.05,
+    };
+    let wscale = match wscale_idx {
+        0 => 100.0, 1 => 6.0, 2 => 10.0, 3 => 50.0, _ => 100.0,
+    };
+    (alpha, wscale, zrun)
+}
+
+/// Encode with compact v19 header (14 bytes total) for specific config.
+/// v19: [MAGIC(4)][19][cfg(1)][primary(4)][mtf_len(4)][rc] = 14 bytes
+/// Config byte encodes (alpha, wscale, zrun) to save 16 bytes vs v21.
+pub fn ssp5_encode_with_range_coder_ewma7_v19(data: &[u8], alpha: f64, wscale: f64, zrun: bool) -> Vec<u8> {
+    if data.is_empty() { return Vec::new(); }
+
+    // Map alpha/wscale to config index
+    let alpha_idx = match alpha {
+        0.05 => 0, 0.1 => 1, 0.001 => 2, 0.0001 => 3, 0.0005 => 4, _ => 0,
+    };
+    let wscale_idx = match wscale {
+        100.0 => 0, 6.0 => 1, 10.0 => 2, 50.0 => 3, _ => 0,
+    };
+    let cfg = (alpha_idx << 3) | (wscale_idx << 1) | (zrun as u8);
+
+    let (primary, bwt_data) = bwt_encode(data);
+    let bwt_packed = pack_bwt(primary, &bwt_data);
+    let mtf_data = mtf_encode(&bwt_packed);
+    let rc_data = if zrun {
+        range_encode_bytes_order_ewma7_alpha_ws(&zrun_encode(&mtf_data), alpha, wscale)
+    } else {
+        range_encode_bytes_order_ewma7_alpha_ws(&mtf_data, alpha, wscale)
+    };
+
+    let mut out = Vec::with_capacity(14 + rc_data.len());
+    out.extend_from_slice(WRAPPER_MAGIC);
+    out.push(WRAPPER_VERSION_RC_EWMA7_ZRUN);
+    out.push(cfg);
+    out.extend_from_slice(&(primary as u32).to_le_bytes());
+    out.extend_from_slice(&(mtf_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&rc_data);
+    out
+}
 
 /// Encode with explicit EWMA decay factor (weight scale = 100). Archive stores params (version 21).
 pub fn ssp5_encode_with_range_coder_ewma7_alpha(data: &[u8], alpha: f64) -> Vec<u8> {
@@ -889,24 +975,52 @@ pub fn ssp5_encode_with_range_coder_ewma7_alpha_ws_zr(data: &[u8], alpha: f64, w
     out
 }
 
-/// Auto-tune: try (alpha, wscale, zrun) candidates and keep the smallest archive.
-/// Base candidate is the plain version-18 archive (13-byte header) — it wins whenever
-/// the default config (0.05, 100) is optimal, avoiding the 16-byte v21 param overhead.
-/// (0.05, 6, zrun) wins on binary/spreadsheet (kennedy.xls 9.51%); (0.1, 100, plain) on text
-/// (alice29 30.68%); (0.1, 100, zrun) on small text (cp.html, fields.c).
+/// Auto-tune: try (alpha, wscale, zrun) candidates with v18 (13B), v21 (30B),
+/// and v19 compact headers (14B) for small-file wins.
+/// v19 saves 16 bytes vs v21, preserving zrun gains on small files.
+/// (0.05, 6, zrun) wins on binary/spreadsheet (kennedy.xls 9.51%);
+/// low-alpha candidates target small text where slow adaptation builds
+/// a stable model; v19 compact header preserves zrun savings on small files.
 pub fn ssp5_encode_with_range_coder_ewma7_auto(data: &[u8]) -> Vec<u8> {
-    let mut best = ssp5_encode_with_range_coder_ewma7(data); // (0.05, 100.0) in v18 format
-    let candidates = [
-        (0.05f64, 6.0f64, true),
+    let mut best = ssp5_encode_with_range_coder_ewma7_v18(data); // v18 (0.05, 100) 13B
+
+    // All (alpha, wscale, zrun) candidates to try
+    let candidates: [(f64, f64, bool); 18] = [
+        (0.05, 6.0, true),
         (0.05, 6.0, false),
         (0.1, 100.0, true),
         (0.1, 100.0, false),
-        (0.05, 100.0, false),
+        (0.05, 100.0, false),        // base v18 candidate
+        (0.001, 10.0, true),
+        (0.001, 50.0, true),
+        (0.01, 10.0, true),
+        (0.01, 50.0, false),
+        // Small-alpha candidates for small files (slow adaptation = less warmup overhead)
+        (0.001, 100.0, true),
+        (0.0005, 100.0, true),
+        (0.0001, 100.0, true),
+        (0.0001, 6.0, true),
+        (0.0005, 6.0, true),
+        (0.001, 100.0, false),
+        (0.0001, 6.0, false),
+        (0.0005, 6.0, false),
+        (0.0001, 100.0, false),
     ];
+
     for &(alpha, wscale, zrun) in &candidates {
-        let enc = ssp5_encode_with_range_coder_ewma7_alpha_ws_zr(data, alpha, wscale, zrun);
-        if enc.len() < best.len() {
-            best = enc;
+        // v21 with full params (30B header)
+        let enc_v21 = ssp5_encode_with_range_coder_ewma7_alpha_ws_zr(data, alpha, wscale, zrun);
+        if enc_v21.len() < best.len() {
+            best = enc_v21;
+        }
+        // v19 compact header (14B) — only for alpha/wscale in config table
+        let alpha_ok = matches!(alpha, 0.05 | 0.1 | 0.001 | 0.0001 | 0.0005);
+        let ws_ok = matches!(wscale, 100.0 | 6.0 | 10.0 | 50.0);
+        if alpha_ok && ws_ok {
+            let enc_v19 = ssp5_encode_with_range_coder_ewma7_v19(data, alpha, wscale, zrun);
+            if enc_v19.len() < best.len() {
+                best = enc_v19;
+            }
         }
     }
     best

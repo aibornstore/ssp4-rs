@@ -7,6 +7,9 @@
 //!   ssp5_decode <input> <output>                           - Decode SSP5 (S extracted from archive)
 //!   auto <input> <output> [block_bits]                    - Alias: encode with auto-optimized S
 //!   optimize <input> [--output <file>] [--block-bits N]    - Find best S-sequence
+//!   ewma7-auto <input> <output>                            - EWMA7 auto-tuned (v19/v21, 18 candidates)
+//!   ewma7-decode <input> <output>                           - Decode EWMA7 archive
+//!   ewma7-v18 <input> <output>                             - Legacy EWMA7 v18 (baseline)
 
 use std::env;
 use std::fs;
@@ -215,6 +218,9 @@ fn main() {
         println!("SSP4/SSP5 Codec CLI v0.4.0");
         println!();
         println!("Usage:");
+        println!("  {} ewma7-auto <input> <output>", args[0]);
+        println!("  {} ewma7-v18 <input> <output>", args[0]);
+        println!("  {} ewma7-decode <input> <output>", args[0]);
         println!("  {} encode <input> <output> [block_bits] [delta] [S]", args[0]);
         println!("  {} decode <input> <output> [S]", args[0]);
         println!("  {} ssp5_encode <input> <output> [block_bits] [--auto | --s=S]", args[0]);
@@ -225,12 +231,15 @@ fn main() {
         println!("Options:");
         println!("  --auto      Automatically find best S-sequence before encoding");
         println!("  --s=S       Use custom S-sequence (comma-separated)");
+        println!("  EWMA7 auto is now DEFAULT for ssp5_encode (18 candidates, v18/v19/v21)");
         println!();
         println!("Examples:");
         println!("  {} ssp5_encode data.txt data.ssp5", args[0]);
         println!("  {} ssp5_encode data.txt data.ssp5 --auto  # auto-optimize S-sequence", args[0]);
         println!("  {} ssp5_encode data.txt data.ssp5 --s=1,2,3,5,7,11", args[0]);
         println!("  {} ssp5_decode data.ssp5 restored.txt", args[0]);
+        println!("  {} ewma7-auto data.txt data.ssp5  # EWMA7 auto-tuned", args[0]);
+        println!("  {} ewma7-v18 data.txt data.ssp5   # EWMA7 v18 baseline", args[0]);
         println!("  {} auto big_text.txt compressed.ssp5  # alias for ssp5_encode --auto", args[0]);
         println!("  {} optimize big_text.txt --output best_s.txt", args[0]);
         return;
@@ -239,6 +248,38 @@ fn main() {
     let cmd = &args[1];
     
     match cmd.as_str() {
+        "ewma7-auto" => {
+            if args.len() < 4 {
+                eprintln!("Usage: {} ewma7-auto <input> <output>", args[0]);
+                return;
+            }
+            let input_path = &args[2];
+            let output_path = &args[3];
+            
+            let data = fs::read(input_path).expect("failed to read input file");
+            let data_len = data.len();
+            
+            println!("EWMA7 auto-tuning (v19 compact header) for {} bytes...", data_len);
+            
+            let t0 = Instant::now();
+            let enc = ssp4_rs::ssp5_encode_with_range_coder_ewma7_auto(&data);
+            let elapsed = t0.elapsed();
+            
+            fs::write(output_path, &enc).expect("failed to write output");
+            let ratio_pct = if data_len > 0 {
+                100.0 * enc.len() as f64 / data_len as f64
+            } else {
+                0.0
+            };
+            println!(
+                "Done: {} → {} bytes ({:.2}%) in {:.3}s",
+                data_len,
+                enc.len(),
+                ratio_pct,
+                elapsed.as_secs_f64()
+            );
+        }
+        
         "encode" => {
             if args.len() < 4 {
                 eprintln!("Usage: {} encode <input> <output> [block_bits] [delta] [S]", args[0]);
@@ -428,6 +469,46 @@ fn main() {
 
             fs::write(output_path, &dec).expect("failed to write output");
             println!("Done: {} bytes decoded in {:.3}s", dec.len(), elapsed.as_secs_f64());
+        }
+        
+        "ewma7-decode" => {
+            if args.len() < 4 {
+                eprintln!("Usage: {} ewma7-decode <input> <output>", args[0]);
+                return;
+            }
+            let input_path = &args[2];
+            let output_path = &args[3];
+
+            let data = fs::read(input_path).expect("failed to read input file");
+            println!("Decoding EWMA7 auto-tuned archive ({} bytes)...", data.len());
+
+            let t0 = Instant::now();
+            let dec = ssp4_rs::ssp5_decode_with_range_coder_ewma7(&data).expect("EWMA7 decode failed");
+            let elapsed = t0.elapsed();
+
+            fs::write(output_path, &dec).expect("failed to write output");
+            println!("Done: {} bytes decoded in {:.3}s", dec.len(), elapsed.as_secs_f64());
+        }
+
+        "ewma7-v18" => {
+            if args.len() < 4 {
+                eprintln!("Usage: {} ewma7-v18 <input> <output>", args[0]);
+                return;
+            }
+            let input_path = &args[2];
+            let output_path = &args[3];
+
+            let data = fs::read(input_path).expect("failed to read input file");
+            let data_len = data.len();
+            println!("EWMA7 v18 baseline encoding {} bytes...", data_len);
+
+            let t0 = Instant::now();
+            let enc = ssp4_rs::ssp5_encode_with_range_coder_ewma7_v18(&data);
+            let elapsed = t0.elapsed();
+
+            fs::write(output_path, &enc).expect("failed to write output");
+            let ratio_pct = if data_len > 0 { 100.0 * enc.len() as f64 / data_len as f64 } else { 0.0 };
+            println!("Done: {} → {} bytes ({:.2}%) in {:.3}s", data_len, enc.len(), ratio_pct, elapsed.as_secs_f64());
         }
         
         "auto" => {

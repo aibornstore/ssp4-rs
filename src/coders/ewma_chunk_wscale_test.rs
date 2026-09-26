@@ -96,7 +96,6 @@ mod tests {
         use super::super::ssp5_pipeline::{ssp5_encode_with_range_coder_ewma7_auto,
                                           ssp5_decode_with_range_coder_ewma7,
                                           ssp5_encode_with_range_coder_ewma7};
-
         let corpus_dir = r"D:\PROJECT UNIVERSE\01Compression\SSP5\tests\comparison_corpora\canterbury";
         let files = ["alice29.txt", "cp.html", "fields.c", "kennedy.xls"];
 
@@ -133,6 +132,62 @@ mod tests {
                  total_in, total_auto, 100.0 * total_auto as f64 / total_in as f64,
                  total_def, 100.0 * total_def as f64 / total_in as f64,
                  100.0 * (total_def - total_auto) as f64 / total_in as f64);
+    }
+
+    /// Sweep prior_k on small files to find optimal warmup for <32KB files.
+    #[test]
+    fn test_ewma7_prior_k_sweep_small_files() {
+        use super::super::ssp5_pipeline::ssp5_encode_with_range_coder_ewma7_v19;
+        use super::super::range_coder::range_encode_bytes_order_ewma7_full;
+        use super::super::bwt::{bwt_encode, pack_bwt};
+        use super::super::mtf::{mtf_encode, zrun_encode};
+
+        let corpus_dir = r"D:\PROJECT UNIVERSE\01Compression\SSP5\tests\comparison_corpora\canterbury";
+        let files = [("cp.html", 24603usize), ("fields.c", 11150usize)];
+        let prior_ks: [u64; 5] = [0, 64, 256, 1024, 2048];
+        let bz2_sizes = [("cp.html", 7624usize), ("fields.c", 3039usize)];
+
+        println!("\n=== EWMA7 prior_k sweep on small files ===");
+        for (name, _) in &files {
+            let path = format!(r"{}\{}", corpus_dir, name);
+            let data = match fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => { println!("{}: SKIPPED", name); continue; }
+            };
+            let bz2 = bz2_sizes.iter().find(|(n, _)| n == name).map(|(_, s)| *s).unwrap_or(0);
+
+            println!("\n{} ({} B, bz2={} B, {:.2}%):", name, data.len(), bz2, 100.0*bz2 as f64/data.len() as f64);
+
+            // Test v19 with zrun for different prior_k
+            for &alpha in &[0.05, 0.1] {
+                for &ws in &[6.0, 100.0] {
+                    for &zrun in &[true, false] {
+                        // Use v21 path with explicit prior_k via full function
+                        let (p, last) = bwt_encode(&data);
+                        let m = mtf_encode(&pack_bwt(p, &last));
+                        for &pk in &prior_ks {
+                            let enc = range_encode_bytes_order_ewma7_full(&m, alpha, ws, pk);
+                            let ratio = 100.0 * enc.len() as f64 / data.len() as f64;
+                            print!("  a={} ws={} z={} pk={}: {} ({:.2}%)", alpha, ws, zrun, pk, enc.len(), ratio);
+                            if zrun {
+                                let z = zrun_encode(&m);
+                                let enc_z = range_encode_bytes_order_ewma7_full(&z, alpha, ws, pk);
+                                let ratio_z = 100.0 * enc_z.len() as f64 / data.len() as f64;
+                                print!(" zrun={} ({:.2}%)", enc_z.len(), ratio_z);
+                            }
+                            println!();
+                        }
+                    }
+                }
+            }
+
+            // Also show v19 with zrun
+            for &(alpha, ws, zrun) in &[(0.05, 6.0, true), (0.1, 100.0, true)] {
+                let enc_v19 = ssp5_encode_with_range_coder_ewma7_v19(&data, alpha, ws, zrun);
+                let ratio = 100.0 * enc_v19.len() as f64 / data.len() as f64;
+                println!("  v19 a={} ws={} zrun={}: {} ({:.2}%)", alpha, ws, zrun, enc_v19.len(), ratio);
+            }
+        }
     }
 
     #[test]
@@ -177,46 +232,129 @@ mod tests {
     }
 
     #[test]
-    fn test_rle1_vs_plain_ewma7_corpus() {
+    fn test_bwt_vs_no_bwt_small_files() {
         use super::super::bwt::{bwt_encode, pack_bwt};
-        use super::super::mtf::{mtf_encode, rle1_encode, rle1_decode, zrun_encode, zrun_decode};
-        use super::super::range_coder::{range_encode_bytes_order_ewma7_alpha_ws, range_decode_bytes_order_ewma7_alpha_ws};
+        use super::super::mtf::{mtf_encode, zrun_encode, zrun_decode};
+        use super::super::range_coder::{range_encode_bytes_order_ewma7_alpha_ws,
+                                        range_decode_bytes_order_ewma7_alpha_ws};
 
         let corpus_dir = r"D:\PROJECT UNIVERSE\01Compression\SSP5\tests\comparison_corpora\canterbury";
         let files = ["fields.c", "cp.html", "alice29.txt", "kennedy.xls"];
-        // Winning configs per data type
+        // bz2 reference sizes: fields.c 3039, cp.html 7624, alice 43202, kennedy 130280
+        let bz2_sizes: [(&str, usize); 4] = [("fields.c", 3039), ("cp.html", 7624),
+                                              ("alice29.txt", 43202), ("kennedy.xls", 130280)];
         let configs: [(f64, f64); 2] = [(0.05, 6.0), (0.1, 100.0)];
 
-        println!("\n=== Transform vs plain, EWMA7 range coder (delta = plain - transformed) ===");
+        println!("\n=== BWT+MTF vs MTF-only (no BWT) — EWMA7 RC ===");
         for name in &files {
             let path = format!(r"{}\{}", corpus_dir, name);
             let data = match fs::read(&path) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
+            let bz2 = bz2_sizes.iter().find(|(n, _)| n == name).map(|(_, s)| *s);
+
+            // Path A: BWT → MTF → zrun → RC
             let (p, last) = bwt_encode(&data);
-            let m = mtf_encode(&pack_bwt(p, &last));
-            let r = rle1_encode(&m);
-            let z = zrun_encode(&m);
+            let m_bwt = mtf_encode(&pack_bwt(p, &last));
+            let z_bwt = zrun_encode(&m_bwt);
 
-            for (label, t, tback) in [
-                ("rle1", r.as_slice(), rle1_decode as fn(&[u8]) -> Vec<u8>),
-                ("zrun", z.as_slice(), zrun_decode as fn(&[u8]) -> Vec<u8>),
-            ] {
-                let mut row = format!("{:>12} {:>4} (mtf {} -> {}):", name, label, m.len(), t.len());
-                for &(alpha, ws) in &configs {
-                    let plain = range_encode_bytes_order_ewma7_alpha_ws(&m, alpha, ws).len();
-                    let enc = range_encode_bytes_order_ewma7_alpha_ws(t, alpha, ws);
-                    row.push_str(&format!(" plain {} {} {} ({:+})", label, plain, enc.len(), plain as i64 - enc.len() as i64));
+            // Path B: raw data → zrun → RC (no BWT, no MTF)
+            let z_raw = zrun_encode(&data);
 
-                    let t_back = range_decode_bytes_order_ewma7_alpha_ws(&enc, alpha, ws).expect("rc decode failed");
-                    assert_eq!(t_back, t, "transformed stream mismatch");
-                    let m_back = tback(&t_back);
-                    assert_eq!(m_back, m, "transform decode mismatch");
-                }
-                println!("{}", row);
+            let mut row = format!("{:>12} ({} B)", name, data.len());
+            for &(alpha, ws) in &configs {
+                let rc_bwt = range_encode_bytes_order_ewma7_alpha_ws(&z_bwt, alpha, ws).len();
+                let rc_raw = range_encode_bytes_order_ewma7_alpha_ws(&z_raw, alpha, ws).len();
+                row.push_str(&format!(" BWT {} | raw {} (raw-bwt={:+})",
+                                      rc_bwt, rc_raw, rc_bwt as i64 - rc_raw as i64));
+            }
+            if let Some(b) = bz2 {
+                row.push_str(&format!(" | bz2 {}", b));
+            }
+            println!("{}", row);
+
+            // Roundtrip raw path
+            for &(alpha, ws) in &configs {
+                let enc = range_encode_bytes_order_ewma7_alpha_ws(&z_raw, alpha, ws);
+                let dec = range_decode_bytes_order_ewma7_alpha_ws(&enc, alpha, ws).expect("rc decode");
+                assert_eq!(dec, z_raw, "raw zrun roundtrip failed");
+                let back = zrun_decode(&dec);
+                assert_eq!(back, data, "raw zrun decode mismatch");
             }
         }
-        println!("All transform roundtrips: OK");
+        println!("All roundtrips: OK");
+    }
+
+    #[test]
+    fn test_ewma7_find_winning_config_small_files() {
+        use super::super::ssp5_pipeline::{
+            ssp5_encode_with_range_coder_ewma7_v19,
+            ssp5_encode_with_range_coder_ewma7,
+            ssp5_encode_with_range_coder_ewma7_auto,
+        };
+        use super::super::bwt::{bwt_encode, pack_bwt};
+        use super::super::mtf::{mtf_encode, zrun_encode};
+        use super::super::range_coder::range_encode_bytes_order_ewma7_full;
+
+        let corpus_dir = r"D:\PROJECT UNIVERSE\01Compression\SSP5\tests\comparison_corpora\canterbury";
+        let files = [("cp.html", 24603usize), ("fields.c", 11150usize)];
+        let bz2_sizes = [("cp.html", 7624usize), ("fields.c", 3039usize)];
+
+        println!("\n=== Finding winning config on small files ===");
+        let candidates: [(f64, f64, bool); 15] = [
+            (0.05, 6.0, true), (0.05, 6.0, false), (0.1, 100.0, true), (0.1, 100.0, false),
+            (0.05, 100.0, false), (0.001, 10.0, true), (0.001, 50.0, true),
+            (0.01, 10.0, true), (0.01, 50.0, false), (0.001, 100.0, true),
+            (0.0005, 100.0, true), (0.0001, 100.0, true), (0.0001, 6.0, true),
+            (0.0005, 6.0, true), (0.001, 100.0, false),
+        ];
+
+        for (name, _) in &files {
+            let path = format!(r"{}\{}", corpus_dir, name);
+            let data = std::fs::read(&path).expect("Failed to read file");
+            let bz2 = bz2_sizes.iter().find(|(n, _)| n == name).map(|(_, s)| *s).unwrap_or(0);
+            let data_len = data.len() as f64;
+
+            println!("\n{} ({} B, bz2={} B, {:.2}%):", name, data.len(), bz2, 100.0 * bz2 as f64 / data_len);
+
+            // Test BWT + MTF + zrun + RC with different configs
+            let (p, last) = bwt_encode(&data);
+            let m = mtf_encode(&pack_bwt(p, &last));
+            println!("  BWT+MTF path (prior_k=1024):");
+            let mut best_bwt = (usize::MAX, 0.0, 0.0, false);
+            for &(alpha, ws, zrun) in &candidates {
+                let z = zrun_encode(&m);
+                let enc = range_encode_bytes_order_ewma7_full(&z, alpha, ws, 1024);
+                if enc.len() < best_bwt.0 {
+                    best_bwt = (enc.len(), alpha, ws, zrun);
+                }
+                print!("    a={} ws={} z={}: {} ({:.2}%)", alpha, ws, zrun, enc.len(), 100.0 * enc.len() as f64 / data_len);
+                if zrun { print!(" zrun"); }
+                println!();
+            }
+            println!("    BEST BWT+MTF: a={} ws={} zrun={} -> {} bytes ({:.2}%)", 
+                     best_bwt.1, best_bwt.2, best_bwt.3, best_bwt.0, 100.0 * best_bwt.0 as f64 / data_len);
+
+            // Test auto function
+            let auto_enc = ssp5_encode_with_range_coder_ewma7_auto(&data);
+            let v18_enc = ssp5_encode_with_range_coder_ewma7(&data);
+            println!("    v18 (0.05,100): {} bytes ({:.2}%)", v18_enc.len(), 100.0 * v18_enc.len() as f64 / data_len);
+            println!("    auto: {} bytes ({:.2}%)", auto_enc.len(), 100.0 * auto_enc.len() as f64 / data_len);
+            
+            // Check best v19 config
+            let mut best_v19 = (usize::MAX, 0.0, 0.0, false);
+            for &alpha_ws_zr in &[(0.05, 6.0, true), (0.1, 100.0, true), (0.001, 10.0, true), (0.01, 10.0, false)] {
+                let (alpha, ws, zr) = alpha_ws_zr;
+                if matches!(alpha, 0.05 | 0.1 | 0.001 | 0.01) && matches!(ws, 100.0 | 6.0 | 10.0 | 50.0) {
+                    let enc = ssp5_encode_with_range_coder_ewma7_v19(&data, alpha, ws, zr);
+                    if enc.len() < best_v19.0 { best_v19 = (enc.len(), alpha, ws, zr); }
+                }
+            }
+            if best_v19.0 != usize::MAX {
+                println!("    best v19: a={} ws={} zrun={} -> {} bytes ({:.2}%)", 
+                         best_v19.1, best_v19.2, best_v19.3, best_v19.0, 100.0 * best_v19.0 as f64 / data_len);
+            }
+        }
     }
 }

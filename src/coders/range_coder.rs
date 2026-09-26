@@ -1675,6 +1675,405 @@ pub fn range_decode_bytes_order_ewma7_full(data: &[u8], alpha: f64, wscale: f64,
     Ok(out)
 }
 
+/// Hybrid EWMA7 for small files: first pass computes actual O0 histogram from MTF stream,
+/// stores it in header (512 bytes u16[256]), uses it as initial O0 model to eliminate warmup overhead.
+/// Archive format: [MAGIC(4)][22][alpha f64][wscale f64][primary u32][mtf_len u32][o0_hist u16[256]][rc]
+pub fn range_encode_bytes_order_ewma7_hybrid(data: &[u8], alpha: f64, wscale: f64) -> Vec<u8> {
+    if data.is_empty() {
+        let mut out = Vec::new();
+        out.push(22); // flag: hybrid EWMA7
+        out.extend_from_slice(&[0u8; 8]); // placeholder for alpha, wscale
+        out.extend_from_slice(&[0u8; 4]); // primary
+        out.extend_from_slice(&[0u8; 4]); // mtf_len
+        return out;
+    }
+
+    // First pass: compute O0 histogram (symbol frequencies in MTF stream)
+    let mut o0_hist = [0u64; 256];
+    for &b in data {
+        o0_hist[b as usize] += 1;
+    }
+
+    let mut enc = RangeEncoder::new();
+
+    // O0 model — initialized from actual histogram with +1 smoothing
+    let mut o0_freqs: [u64; 256] = core::array::from_fn(|i| o0_hist[i] + 1);
+    let mut o0_total: u64 = o0_freqs.iter().sum();
+
+    // O1 model
+    let mut o1_freqs = [[1u64; 256]; 256];
+    let mut o1_totals = [256u64; 256];
+
+    // O2 model
+    let mut o2_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; 256 * 256];
+    let mut o2_totals: Vec<u64> = vec![256u64; 256 * 256];
+
+    // O3-O7 models - sparse fixed tables (65K entries each)
+    let mut o3_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; O3_TABLE_SIZE];
+    let mut o3_totals: Vec<u64> = vec![256u64; O3_TABLE_SIZE];
+    let mut o4_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; O3_TABLE_SIZE];
+    let mut o4_totals: Vec<u64> = vec![256u64; O3_TABLE_SIZE];
+    let mut o5_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; O3_TABLE_SIZE];
+    let mut o5_totals: Vec<u64> = vec![256u64; O3_TABLE_SIZE];
+    let mut o6_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; O3_TABLE_SIZE];
+    let mut o6_totals: Vec<u64> = vec![256u64; O3_TABLE_SIZE];
+    let mut o7_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; O3_TABLE_SIZE];
+    let mut o7_totals: Vec<u64> = vec![256u64; O3_TABLE_SIZE];
+
+    // EWMA error tracking
+    let mut o0_err: f64 = 0.5;
+    let mut o1_err: f64 = 0.5;
+    let mut o2_err: f64 = 0.5;
+    let mut o3_err: f64 = 0.5;
+    let mut o4_err: f64 = 0.5;
+    let mut o5_err: f64 = 0.5;
+    let mut o6_err: f64 = 0.5;
+    let mut o7_err: f64 = 0.5;
+
+    // History registers
+    let mut prev1 = 0u8;
+    let mut prev2 = 0u8;
+    let mut prev3 = 0u8;
+    let mut prev4 = 0u8;
+    let mut prev5 = 0u8;
+    let mut prev6 = 0u8;
+    let mut prev7 = 0u8;
+
+    for &b in data {
+        let sym = b as usize;
+        let o1_ctx = prev1 as usize;
+        let o2_ctx = (prev1 as usize) * 256 + (prev2 as usize);
+        let o3_idx = o3_hash(prev1, prev2, prev3);
+        let o4_idx = o4_hash(prev1, prev2, prev3, prev4);
+        let o5_idx = o5_hash(prev1, prev2, prev3, prev4, prev5);
+        let o6_idx = o6_hash(prev1, prev2, prev3, prev4, prev5, prev6);
+        let o7_idx = o7_hash(prev1, prev2, prev3, prev4, prev5, prev6, prev7);
+
+        let o3_total = o3_totals[o3_idx];
+        let o4_total = o4_totals[o4_idx];
+        let o5_total = o5_totals[o5_idx];
+        let o6_total = o6_totals[o6_idx];
+        let o7_total = o7_totals[o7_idx];
+
+        let o3_reliable = o3_total >= O3_MIN_SAMPLES;
+        let o4_reliable = o4_total >= O4_MIN_SAMPLES;
+        let o5_reliable = o5_total >= O5_MIN_SAMPLES;
+        let o6_reliable = o6_total >= O6_MIN_SAMPLES;
+        let o7_reliable = o7_total >= O7_MIN_SAMPLES;
+
+        // Compute inverse-error weights
+        let inv_o0 = 1.0 / (o0_err + 0.001);
+        let inv_o1 = 1.0 / (o1_err + 0.001);
+        let inv_o2 = 1.0 / (o2_err + 0.001);
+        let inv_o3 = if o3_reliable { 1.0 / (o3_err + 0.001) } else { 0.001 };
+        let inv_o4 = if o4_reliable { 1.0 / (o4_err + 0.001) } else { 0.001 };
+        let inv_o5 = if o5_reliable { 1.0 / (o5_err + 0.001) } else { 0.001 };
+        let inv_o6 = if o6_reliable { 1.0 / (o6_err + 0.001) } else { 0.001 };
+        let inv_o7 = if o7_reliable { 1.0 / (o7_err + 0.001) } else { 0.001 };
+        let inv_sum = inv_o0 + inv_o1 + inv_o2 + inv_o3 + inv_o4 + inv_o5 + inv_o6 + inv_o7;
+
+        let mut w0 = ((inv_o0 / inv_sum) * wscale) as u64;
+        let w1 = ((inv_o1 / inv_sum) * wscale) as u64;
+        let w2 = ((inv_o2 / inv_sum) * wscale) as u64;
+        let w3 = ((inv_o3 / inv_sum) * wscale) as u64;
+        let w4 = ((inv_o4 / inv_sum) * wscale) as u64;
+        let w5 = ((inv_o5 / inv_sum) * wscale) as u64;
+        let w6 = ((inv_o6 / inv_sum) * wscale) as u64;
+        let w7 = ((inv_o7 / inv_sum) * wscale) as u64;
+        if w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7 == 0 {
+            w0 = 1;
+        }
+
+        // Cumulative frequencies
+        let o0_cum: u64 = o0_freqs[..sym].iter().sum();
+        let o1_cum: u64 = o1_freqs[o1_ctx][..sym].iter().sum();
+        let o2_cum: u64 = o2_freqs[o2_ctx][..sym].iter().sum();
+        let o3_cum: u64 = o3_freqs[o3_idx][..sym].iter().sum();
+        let o4_cum: u64 = o4_freqs[o4_idx][..sym].iter().sum();
+        let o5_cum: u64 = o5_freqs[o5_idx][..sym].iter().sum();
+        let o6_cum: u64 = o6_freqs[o6_idx][..sym].iter().sum();
+        let o7_cum: u64 = o7_freqs[o7_idx][..sym].iter().sum();
+
+        let mixed_cum = o0_cum*w0 + o1_cum*w1 + o2_cum*w2 + o3_cum*w3 + o4_cum*w4 + o5_cum*w5 + o6_cum*w6 + o7_cum*w7;
+
+        let o0_count = o0_freqs[sym];
+        let o1_count = o1_freqs[o1_ctx][sym];
+        let o2_count = o2_freqs[o2_ctx][sym];
+        let o3_count = o3_freqs[o3_idx][sym];
+        let o4_count = o4_freqs[o4_idx][sym];
+        let o5_count = o5_freqs[o5_idx][sym];
+        let o6_count = o6_freqs[o6_idx][sym];
+        let o7_count = o7_freqs[o7_idx][sym];
+
+        let mixed_count = o0_count*w0 + o1_count*w1 + o2_count*w2 + o3_count*w3 + o4_count*w4 + o5_count*w5 + o6_count*w6 + o7_count*w7;
+        let mixed_total = o0_total*w0 + o1_totals[o1_ctx]*w1 + o2_totals[o2_ctx]*w2 
+            + o3_total*w3 + o4_total*w4 + o5_total*w5 + o6_total*w6 + o7_total*w7;
+
+        // Encode
+        let total = mixed_total.max(1);
+        let cum = mixed_cum.min(total - 1);
+        let freq = mixed_count.max(1).min(total - cum);
+
+        enc.encode(cum, freq, total);
+
+        // Update errors
+        let actual_prob = freq as f64 / total as f64;
+        let symbol_prob = 1.0 / 256.0;
+        let o0_err_delta = (actual_prob - symbol_prob).abs();
+        let o1_err_delta = (actual_prob - o1_freqs[o1_ctx][sym] as f64 / o1_totals[o1_ctx] as f64).abs();
+        let o2_err_delta = (actual_prob - o2_freqs[o2_ctx][sym] as f64 / o2_totals[o2_ctx] as f64).abs();
+        let o3_err_delta = if o3_reliable { (actual_prob - o3_count as f64 / o3_total as f64).abs() } else { 0.5 };
+        let o4_err_delta = if o4_reliable { (actual_prob - o4_count as f64 / o4_total as f64).abs() } else { 0.5 };
+        let o5_err_delta = if o5_reliable { (actual_prob - o5_count as f64 / o5_total as f64).abs() } else { 0.5 };
+        let o6_err_delta = if o6_reliable { (actual_prob - o6_count as f64 / o6_total as f64).abs() } else { 0.5 };
+        let o7_err_delta = if o7_reliable { (actual_prob - o7_count as f64 / o7_total as f64).abs() } else { 0.5 };
+
+        o0_err = (1.0 - alpha) * o0_err + alpha * o0_err_delta;
+        o1_err = (1.0 - alpha) * o1_err + alpha * o1_err_delta;
+        o2_err = (1.0 - alpha) * o2_err + alpha * o2_err_delta;
+        o3_err = (1.0 - alpha) * o3_err + alpha * o3_err_delta;
+        o4_err = (1.0 - alpha) * o4_err + alpha * o4_err_delta;
+        o5_err = (1.0 - alpha) * o5_err + alpha * o5_err_delta;
+        o6_err = (1.0 - alpha) * o6_err + alpha * o6_err_delta;
+        o7_err = (1.0 - alpha) * o7_err + alpha * o7_err_delta;
+
+        // Update all models
+        o0_freqs[sym] += 1; o0_total += 1;
+        o1_freqs[o1_ctx][sym] += 1; o1_totals[o1_ctx] += 1;
+        o2_freqs[o2_ctx][sym] += 1; o2_totals[o2_ctx] += 1;
+        o3_freqs[o3_idx][sym] += 1; o3_totals[o3_idx] += 1;
+        o4_freqs[o4_idx][sym] += 1; o4_totals[o4_idx] += 1;
+        o5_freqs[o5_idx][sym] += 1; o5_totals[o5_idx] += 1;
+        o6_freqs[o6_idx][sym] += 1; o6_totals[o6_idx] += 1;
+        o7_freqs[o7_idx][sym] += 1; o7_totals[o7_idx] += 1;
+
+        // Shift history
+        prev7 = prev6; prev6 = prev5; prev5 = prev4;
+        prev4 = prev3; prev3 = prev2; prev2 = prev1; prev1 = b;
+    }
+
+    let mut out = Vec::new();
+    out.push(22); // flag: hybrid EWMA7
+    out.extend_from_slice(&alpha.to_le_bytes());
+    out.extend_from_slice(&wscale.to_le_bytes());
+    out.extend_from_slice(&(0u32).to_le_bytes()); // primary placeholder
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // mtf_len = data.len() for direct MTF stream
+    
+    // Store O0 histogram as u16[256] (512 bytes) — clamp to u16::MAX
+    for i in 0..256 {
+        let v = o0_hist[i].min(u16::MAX as u64) as u16;
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    
+    out.extend(enc.flush());
+    out
+}
+
+/// Decode data encoded with hybrid EWMA7 (version 22).
+/// Reads O0 histogram from header, uses it as initial O0 model.
+pub fn range_decode_bytes_order_ewma7_hybrid(data: &[u8], alpha: f64, wscale: f64) -> Result<Vec<u8>, &'static str> {
+    if data.len() < 1 + 8 + 4 + 4 + 512 {
+        return Err("Range decode: hybrid data too short");
+    }
+    let flag = data[0];
+    if flag != 22 {
+        return Err("Range decode: not hybrid EWMA7 encoded");
+    }
+
+    // Read alpha, wscale from header
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&data[1..9]);
+    let mut w = [0u8; 8];
+    w.copy_from_slice(&data[9..17]);
+    let _alpha = f64::from_le_bytes(a);
+    let _wscale = f64::from_le_bytes(w);
+    // Note: alpha and wscale from header must match the ones passed in
+
+    let primary = u32::from_le_bytes([data[17], data[18], data[19], data[20]]);
+    let mtf_len = u32::from_le_bytes([data[21], data[22], data[23], data[24]]) as usize;
+
+    // Read O0 histogram from header (512 bytes = 256 u16 LE)
+    let mut o0_hist = [0u64; 256];
+    for i in 0..256 {
+        let off = 25 + i * 2;
+        let v = u16::from_le_bytes([data[off], data[off + 1]]);
+        o0_hist[i] = v as u64;
+    }
+
+    let range_data = &data[25 + 512..];
+    let mut dec = RangeDecoder::new(range_data);
+    let mut out = Vec::with_capacity(mtf_len);
+
+    // O0 model — initialized from stored histogram with +1 smoothing
+    let mut o0_freqs: [u64; 256] = core::array::from_fn(|i| o0_hist[i] + 1);
+    let mut o0_total: u64 = o0_freqs.iter().sum();
+
+    // O1 model
+    let mut o1_freqs = [[1u64; 256]; 256];
+    let mut o1_totals = [256u64; 256];
+
+    // O2 model
+    let mut o2_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; 256 * 256];
+    let mut o2_totals: Vec<u64> = vec![256u64; 256 * 256];
+
+    // O3-O7 models
+    let mut o3_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; O3_TABLE_SIZE];
+    let mut o3_totals: Vec<u64> = vec![256u64; O3_TABLE_SIZE];
+    let mut o4_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; O3_TABLE_SIZE];
+    let mut o4_totals: Vec<u64> = vec![256u64; O3_TABLE_SIZE];
+    let mut o5_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; O3_TABLE_SIZE];
+    let mut o5_totals: Vec<u64> = vec![256u64; O3_TABLE_SIZE];
+    let mut o6_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; O3_TABLE_SIZE];
+    let mut o6_totals: Vec<u64> = vec![256u64; O3_TABLE_SIZE];
+    let mut o7_freqs: Vec<[u64; 256]> = vec![[1u64; 256]; O3_TABLE_SIZE];
+    let mut o7_totals: Vec<u64> = vec![256u64; O3_TABLE_SIZE];
+
+    let mut o0_err: f64 = 0.5;
+    let mut o1_err: f64 = 0.5;
+    let mut o2_err: f64 = 0.5;
+    let mut o3_err: f64 = 0.5;
+    let mut o4_err: f64 = 0.5;
+    let mut o5_err: f64 = 0.5;
+    let mut o6_err: f64 = 0.5;
+    let mut o7_err: f64 = 0.5;
+
+    let mut prev1 = 0u8;
+    let mut prev2 = 0u8;
+    let mut prev3 = 0u8;
+    let mut prev4 = 0u8;
+    let mut prev5 = 0u8;
+    let mut prev6 = 0u8;
+    let mut prev7 = 0u8;
+
+    for _ in 0..mtf_len {
+        let o1_ctx = prev1 as usize;
+        let o2_ctx = (prev1 as usize) * 256 + (prev2 as usize);
+        let o3_idx = o3_hash(prev1, prev2, prev3);
+        let o4_idx = o4_hash(prev1, prev2, prev3, prev4);
+        let o5_idx = o5_hash(prev1, prev2, prev3, prev4, prev5);
+        let o6_idx = o6_hash(prev1, prev2, prev3, prev4, prev5, prev6);
+        let o7_idx = o7_hash(prev1, prev2, prev3, prev4, prev5, prev6, prev7);
+
+        let o3_total = o3_totals[o3_idx];
+        let o4_total = o4_totals[o4_idx];
+        let o5_total = o5_totals[o5_idx];
+        let o6_total = o6_totals[o6_idx];
+        let o7_total = o7_totals[o7_idx];
+
+        let o3_reliable = o3_total >= O3_MIN_SAMPLES;
+        let o4_reliable = o4_total >= O4_MIN_SAMPLES;
+        let o5_reliable = o5_total >= O5_MIN_SAMPLES;
+        let o6_reliable = o6_total >= O6_MIN_SAMPLES;
+        let o7_reliable = o7_total >= O7_MIN_SAMPLES;
+
+        let inv_o0 = 1.0 / (o0_err + 0.001);
+        let inv_o1 = 1.0 / (o1_err + 0.001);
+        let inv_o2 = 1.0 / (o2_err + 0.001);
+        let inv_o3 = if o3_reliable { 1.0 / (o3_err + 0.001) } else { 0.001 };
+        let inv_o4 = if o4_reliable { 1.0 / (o4_err + 0.001) } else { 0.001 };
+        let inv_o5 = if o5_reliable { 1.0 / (o5_err + 0.001) } else { 0.001 };
+        let inv_o6 = if o6_reliable { 1.0 / (o6_err + 0.001) } else { 0.001 };
+        let inv_o7 = if o7_reliable { 1.0 / (o7_err + 0.001) } else { 0.001 };
+        let inv_sum = inv_o0 + inv_o1 + inv_o2 + inv_o3 + inv_o4 + inv_o5 + inv_o6 + inv_o7;
+
+        let mut w0 = ((inv_o0 / inv_sum) * wscale) as u64;
+        let w1 = ((inv_o1 / inv_sum) * wscale) as u64;
+        let w2 = ((inv_o2 / inv_sum) * wscale) as u64;
+        let w3 = ((inv_o3 / inv_sum) * wscale) as u64;
+        let w4 = ((inv_o4 / inv_sum) * wscale) as u64;
+        let w5 = ((inv_o5 / inv_sum) * wscale) as u64;
+        let w6 = ((inv_o6 / inv_sum) * wscale) as u64;
+        let w7 = ((inv_o7 / inv_sum) * wscale) as u64;
+        if w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7 == 0 {
+            w0 = 1;
+        }
+
+        let mixed_total = o0_total*w0 + o1_totals[o1_ctx]*w1 + o2_totals[o2_ctx]*w2 
+            + o3_total*w3 + o4_total*w4 + o5_total*w5 + o6_total*w6 + o7_total*w7;
+        let f = dec.get_freq(mixed_total.max(1));
+
+        // Find symbol
+        let mut sym = 0u8;
+        let mut cum = 0u64;
+        for s in 0..256 {
+            let o0_cum = o0_freqs[..s].iter().sum::<u64>();
+            let o1_cum = o1_freqs[o1_ctx][..s].iter().sum::<u64>();
+            let o2_cum = o2_freqs[o2_ctx][..s].iter().sum::<u64>();
+            let o3_cum = o3_freqs[o3_idx][..s].iter().sum::<u64>();
+            let o4_cum = o4_freqs[o4_idx][..s].iter().sum::<u64>();
+            let o5_cum = o5_freqs[o5_idx][..s].iter().sum::<u64>();
+            let o6_cum = o6_freqs[o6_idx][..s].iter().sum::<u64>();
+            let o7_cum = o7_freqs[o7_idx][..s].iter().sum::<u64>();
+
+            let next_cum = o0_cum*w0 + o1_cum*w1 + o2_cum*w2 + o3_cum*w3 + o4_cum*w4 + o5_cum*w5 + o6_cum*w6 + o7_cum*w7
+                + o0_freqs[s]*w0 + o1_freqs[o1_ctx][s]*w1 + o2_freqs[o2_ctx][s]*w2 
+                + o3_freqs[o3_idx][s]*w3 + o4_freqs[o4_idx][s]*w4 + o5_freqs[o5_idx][s]*w5
+                + o6_freqs[o6_idx][s]*w6 + o7_freqs[o7_idx][s]*w7;
+
+            if cum <= f && f < next_cum {
+                sym = s as u8;
+                break;
+            }
+            cum = next_cum;
+        }
+
+        let o0_cum = o0_freqs[..sym as usize].iter().sum::<u64>();
+        let o1_cum = o1_freqs[o1_ctx][..sym as usize].iter().sum::<u64>();
+        let o2_cum = o2_freqs[o2_ctx][..sym as usize].iter().sum::<u64>();
+        let o3_cum = o3_freqs[o3_idx][..sym as usize].iter().sum::<u64>();
+        let o4_cum = o4_freqs[o4_idx][..sym as usize].iter().sum::<u64>();
+        let o5_cum = o5_freqs[o5_idx][..sym as usize].iter().sum::<u64>();
+        let o6_cum = o6_freqs[o6_idx][..sym as usize].iter().sum::<u64>();
+        let o7_cum = o7_freqs[o7_idx][..sym as usize].iter().sum::<u64>();
+
+        let dec_cum = o0_cum*w0 + o1_cum*w1 + o2_cum*w2 + o3_cum*w3 + o4_cum*w4 + o5_cum*w5 + o6_cum*w6 + o7_cum*w7;
+        let dec_freq = o0_freqs[sym as usize]*w0 + o1_freqs[o1_ctx][sym as usize]*w1 
+            + o2_freqs[o2_ctx][sym as usize]*w2 + o3_freqs[o3_idx][sym as usize]*w3
+            + o4_freqs[o4_idx][sym as usize]*w4 + o5_freqs[o5_idx][sym as usize]*w5
+            + o6_freqs[o6_idx][sym as usize]*w6 + o7_freqs[o7_idx][sym as usize]*w7;
+
+        dec.decode(dec_cum, dec_freq.max(1), mixed_total.max(1));
+        out.push(sym);
+
+        // Update errors
+        let total = mixed_total.max(1);
+        let actual_prob = dec_freq as f64 / total as f64;
+        let symbol_prob = 1.0 / 256.0;
+        let o0_err_delta = (actual_prob - symbol_prob).abs();
+        let o1_err_delta = (actual_prob - o1_freqs[o1_ctx][sym as usize] as f64 / o1_totals[o1_ctx] as f64).abs();
+        let o2_err_delta = (actual_prob - o2_freqs[o2_ctx][sym as usize] as f64 / o2_totals[o2_ctx].max(1) as f64).abs();
+        let o3_err_delta = if o3_reliable { let c = o3_freqs[o3_idx][sym as usize]; let t = o3_totals[o3_idx]; (actual_prob - c as f64 / t.max(1) as f64).abs() } else { 0.5 };
+        let o4_err_delta = if o4_reliable { let c = o4_freqs[o4_idx][sym as usize]; let t = o4_totals[o4_idx]; (actual_prob - c as f64 / t.max(1) as f64).abs() } else { 0.5 };
+        let o5_err_delta = if o5_reliable { let c = o5_freqs[o5_idx][sym as usize]; let t = o5_totals[o5_idx]; (actual_prob - c as f64 / t.max(1) as f64).abs() } else { 0.5 };
+        let o6_err_delta = if o6_reliable { let c = o6_freqs[o6_idx][sym as usize]; let t = o6_totals[o6_idx]; (actual_prob - c as f64 / t.max(1) as f64).abs() } else { 0.5 };
+        let o7_err_delta = if o7_reliable { let c = o7_freqs[o7_idx][sym as usize]; let t = o7_totals[o7_idx]; (actual_prob - c as f64 / t.max(1) as f64).abs() } else { 0.5 };
+
+        o0_err = (1.0 - alpha) * o0_err + alpha * o0_err_delta;
+        o1_err = (1.0 - alpha) * o1_err + alpha * o1_err_delta;
+        o2_err = (1.0 - alpha) * o2_err + alpha * o2_err_delta;
+        o3_err = (1.0 - alpha) * o3_err + alpha * o3_err_delta;
+        o4_err = (1.0 - alpha) * o4_err + alpha * o4_err_delta;
+        o5_err = (1.0 - alpha) * o5_err + alpha * o5_err_delta;
+        o6_err = (1.0 - alpha) * o6_err + alpha * o6_err_delta;
+        o7_err = (1.0 - alpha) * o7_err + alpha * o7_err_delta;
+
+        // Update models
+        o0_freqs[sym as usize] += 1; o0_total += 1;
+        o1_freqs[o1_ctx][sym as usize] += 1; o1_totals[o1_ctx] += 1;
+        o2_freqs[o2_ctx][sym as usize] += 1; o2_totals[o2_ctx] += 1;
+        o3_freqs[o3_idx][sym as usize] += 1; o3_totals[o3_idx] += 1;
+        o4_freqs[o4_idx][sym as usize] += 1; o4_totals[o4_idx] += 1;
+        o5_freqs[o5_idx][sym as usize] += 1; o5_totals[o5_idx] += 1;
+        o6_freqs[o6_idx][sym as usize] += 1; o6_totals[o6_idx] += 1;
+        o7_freqs[o7_idx][sym as usize] += 1; o7_totals[o7_idx] += 1;
+
+        prev7 = prev6; prev6 = prev5; prev5 = prev4;
+        prev4 = prev3; prev3 = prev2; prev2 = prev1; prev1 = sym;
+    }
+
+    Ok(out)
+}
+
 pub fn range_encode_bytes_order_ewma(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
         let mut out = Vec::new();
