@@ -1,0 +1,46 @@
+{
+  "schema": "ARTWEB_PROJECT_RECOVERY_MANIFEST_V1",
+  "project": "ssp4-rs",
+  "repository": "aibornstore/ssp4-rs",
+  "recovery_root": null,
+  "recovery_requires_primary_working_disk": true,
+  "canonical_standard": "aibornstore/connect-canon/docs/ARTWEB_PROJECT_RECOVERY_CONTINUITY_STANDARD_V1.md",
+  "channels": [
+    {
+      "name": "primary-control",
+      "status": "NEEDS_RUNTIME_CERTIFICATION"
+    },
+    {
+      "name": "independent-recovery",
+      "status": "NOT_AVAILABLE"
+    }
+  ],
+  "artifacts": {
+    "status": "RECOVERY_STATUS.json",
+    "manifest": ".artweb/PROJECT_RECOVERY_MANIFEST.json",
+    "continuity": "PROJECT_CONTINUITY.json",
+    "runbook": "docs/operations/PROJECT_RECOVERY_CONTINUITY.md",
+    "golden": "golden-current"
+  },
+  "continuity": {
+    "canonical_path": null,
+    "branch": "master",
+    "head": null,
+    "dirty_count": null,
+    "emergency_copy": null,
+    "next_step": "Bind actual host/path/runtime and certify recovery independently."
+  },
+  "invariants": [
+    "Reconcile live state before retry after interrupted tool/chat streams.",
+    "Never copy another project's operational host/IP/path/credential facts.",
+    "Never commit secrets or durable sessions."
+  ],
+  "certification": {
+    "recovery_root": "PENDING",
+    "channel_failover": "PENDING",
+    "self_heal": "PENDING",
+    "fault_injection": "PENDING",
+    "continuity_restore": "PENDING"
+  },
+  "status": "STANDARD_LINKED_NEEDS_RUNTIME_CERTIFICATION"
+}
